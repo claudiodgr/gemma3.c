@@ -1,0 +1,560 @@
+/*
+ * gemma3_kernels.c - CPU compute kernel implementations for Gemma 3 inference
+ *
+ * Pure C implementation optimized for clarity and correctness.
+ * Can be extended with SIMD optimizations.
+ */
+
+#include "gemma3_kernels.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <float.h>
+
+/* Random state for sampling */
+static uint64_t g_rng_state = 12345678901234567ULL;
+
+/* ============================================================================
+ * Basic Tensor Operations
+ * ========================================================================== */
+
+void gemma3_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
+    // C[i,j] = sum_k A[i,k] * B[k,j]
+    // A: [M, K], B: [K, N], C: [M, N]
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) {
+                sum += A[i * K + k] * B[k * N + j];
+            }
+            C[i * N + j] = sum;
+        }
+    }
+}
+
+void gemma3_matvec(float *y, const float *A, const float *x, int M, int K) {
+    // y[i] = sum_k A[i,k] * x[k]
+    for (int i = 0; i < M; i++) {
+        float sum = 0.0f;
+        const float *row = A + i * K;
+        for (int k = 0; k < K; k++) {
+            sum += row[k] * x[k];
+        }
+        y[i] = sum;
+    }
+}
+
+void gemma3_matvec_batched(float *y, const float *A, const float *x,
+                           int batch, int M, int K) {
+    for (int b = 0; b < batch; b++) {
+        gemma3_matvec(y + b * M, A + b * M * K, x + b * K, M, K);
+    }
+}
+
+void gemma3_vec_add(float *y, const float *a, const float *b, int n) {
+    for (int i = 0; i < n; i++) {
+        y[i] = a[i] + b[i];
+    }
+}
+
+void gemma3_vec_mul(float *y, const float *a, const float *b, int n) {
+    for (int i = 0; i < n; i++) {
+        y[i] = a[i] * b[i];
+    }
+}
+
+void gemma3_vec_scale(float *y, const float *x, float scale, int n) {
+    for (int i = 0; i < n; i++) {
+        y[i] = x[i] * scale;
+    }
+}
+
+void gemma3_vec_copy(float *dst, const float *src, int n) {
+    memcpy(dst, src, n * sizeof(float));
+}
+
+void gemma3_vec_zero(float *x, int n) {
+    memset(x, 0, n * sizeof(float));
+}
+
+/* ============================================================================
+ * Normalization
+ * ========================================================================== */
+
+void gemma3_rmsnorm(float *y, const float *x, const float *weight,
+                    int n, float eps) {
+    // Compute mean of squares
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) {
+        ss += x[i] * x[i];
+    }
+    ss = ss / n + eps;
+    float rsqrt_ss = 1.0f / sqrtf(ss);
+
+    // Normalize and scale
+    for (int i = 0; i < n; i++) {
+        y[i] = x[i] * rsqrt_ss * weight[i];
+    }
+}
+
+void gemma3_rmsnorm_inplace(float *x, const float *weight, int n, float eps) {
+    // Compute mean of squares
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) {
+        ss += x[i] * x[i];
+    }
+    ss = ss / n + eps;
+    float rsqrt_ss = 1.0f / sqrtf(ss);
+
+    // Normalize and scale in-place
+    for (int i = 0; i < n; i++) {
+        x[i] = x[i] * rsqrt_ss * weight[i];
+    }
+}
+
+/* ============================================================================
+ * Activation Functions
+ * ========================================================================== */
+
+void gemma3_gelu_tanh(float *y, const float *x, int n) {
+    // GELU with tanh approximation:
+    // gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    const float sqrt_2_over_pi = 0.7978845608028654f;  // sqrt(2/pi)
+    const float coeff = 0.044715f;
+
+    for (int i = 0; i < n; i++) {
+        float xi = x[i];
+        float x3 = xi * xi * xi;
+        float inner = sqrt_2_over_pi * (xi + coeff * x3);
+        y[i] = 0.5f * xi * (1.0f + tanhf(inner));
+    }
+}
+
+void gemma3_gelu_tanh_inplace(float *x, int n) {
+    const float sqrt_2_over_pi = 0.7978845608028654f;
+    const float coeff = 0.044715f;
+
+    for (int i = 0; i < n; i++) {
+        float xi = x[i];
+        float x3 = xi * xi * xi;
+        float inner = sqrt_2_over_pi * (xi + coeff * x3);
+        x[i] = 0.5f * xi * (1.0f + tanhf(inner));
+    }
+}
+
+void gemma3_silu(float *y, const float *x, int n) {
+    // SiLU (Swish): silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    for (int i = 0; i < n; i++) {
+        float xi = x[i];
+        y[i] = xi / (1.0f + expf(-xi));
+    }
+}
+
+void gemma3_silu_inplace(float *x, int n) {
+    for (int i = 0; i < n; i++) {
+        float xi = x[i];
+        x[i] = xi / (1.0f + expf(-xi));
+    }
+}
+
+void gemma3_softmax(float *y, const float *x, int n) {
+    // Find max for numerical stability
+    float max_val = x[0];
+    for (int i = 1; i < n; i++) {
+        if (x[i] > max_val) max_val = x[i];
+    }
+
+    // Compute exp(x - max) and sum
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        y[i] = expf(x[i] - max_val);
+        sum += y[i];
+    }
+
+    // Normalize
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < n; i++) {
+        y[i] *= inv_sum;
+    }
+}
+
+void gemma3_softmax_inplace(float *x, int n) {
+    // Find max for numerical stability
+    float max_val = x[0];
+    for (int i = 1; i < n; i++) {
+        if (x[i] > max_val) max_val = x[i];
+    }
+
+    // Compute exp(x - max) and sum
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+
+    // Normalize
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < n; i++) {
+        x[i] *= inv_sum;
+    }
+}
+
+/* ============================================================================
+ * Positional Encoding (RoPE)
+ * ========================================================================== */
+
+void gemma3_rope_single(float *x, int head_dim, int pos, float theta) {
+    // Apply rotary position embedding to a single vector
+    // x is modified in-place
+    // head_dim must be even
+
+    int half_dim = head_dim / 2;
+    for (int i = 0; i < half_dim; i++) {
+        // Compute frequency for this dimension
+        float freq = 1.0f / powf(theta, (float)(2 * i) / (float)head_dim);
+        float angle = (float)pos * freq;
+        float cos_val = cosf(angle);
+        float sin_val = sinf(angle);
+
+        // Apply rotation
+        float x0 = x[i];
+        float x1 = x[i + half_dim];
+        x[i] = x0 * cos_val - x1 * sin_val;
+        x[i + half_dim] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+void gemma3_rope(float *q, float *k, int n_heads, int n_kv_heads,
+                 int head_dim, int pos, float theta) {
+    // Apply RoPE to all query heads
+    for (int h = 0; h < n_heads; h++) {
+        gemma3_rope_single(q + h * head_dim, head_dim, pos, theta);
+    }
+
+    // Apply RoPE to all key heads
+    for (int h = 0; h < n_kv_heads; h++) {
+        gemma3_rope_single(k + h * head_dim, head_dim, pos, theta);
+    }
+}
+
+void gemma3_rope_precompute(float *freqs, int max_pos, int head_dim, float theta) {
+    // Precompute cos/sin values for all positions
+    // freqs: [max_pos, head_dim/2, 2] where last dim is (cos, sin)
+    int half_dim = head_dim / 2;
+
+    for (int pos = 0; pos < max_pos; pos++) {
+        for (int i = 0; i < half_dim; i++) {
+            float freq = 1.0f / powf(theta, (float)(2 * i) / (float)head_dim);
+            float angle = (float)pos * freq;
+            freqs[(pos * half_dim + i) * 2] = cosf(angle);
+            freqs[(pos * half_dim + i) * 2 + 1] = sinf(angle);
+        }
+    }
+}
+
+void gemma3_rope_apply_precomputed(float *x, const float *freqs,
+                                    int head_dim, int pos) {
+    int half_dim = head_dim / 2;
+    const float *pos_freqs = freqs + pos * half_dim * 2;
+
+    for (int i = 0; i < half_dim; i++) {
+        float cos_val = pos_freqs[i * 2];
+        float sin_val = pos_freqs[i * 2 + 1];
+
+        float x0 = x[i];
+        float x1 = x[i + half_dim];
+        x[i] = x0 * cos_val - x1 * sin_val;
+        x[i + half_dim] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+/* ============================================================================
+ * Attention Operations
+ * ========================================================================== */
+
+void gemma3_attention_single(float *output, const float *q,
+                             const float *k_cache, const float *v_cache,
+                             int seq_len, int head_dim, float scale,
+                             const float *mask) {
+    // Allocate temporary storage for attention scores
+    float *scores = (float *)malloc(seq_len * sizeof(float));
+    if (!scores) return;
+
+    // Compute attention scores: scores[i] = q . k[i] * scale
+    for (int i = 0; i < seq_len; i++) {
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            score += q[d] * k_cache[i * head_dim + d];
+        }
+        scores[i] = score * scale;
+
+        // Apply mask if provided
+        if (mask) {
+            scores[i] += mask[i];
+        }
+    }
+
+    // Softmax
+    gemma3_softmax_inplace(scores, seq_len);
+
+    // Compute weighted sum of values
+    gemma3_vec_zero(output, head_dim);
+    for (int i = 0; i < seq_len; i++) {
+        float w = scores[i];
+        for (int d = 0; d < head_dim; d++) {
+            output[d] += w * v_cache[i * head_dim + d];
+        }
+    }
+
+    free(scores);
+}
+
+void gemma3_gqa(float *output, const float *q,
+                const float *k_cache, const float *v_cache,
+                int n_heads, int n_kv_heads, int seq_len, int head_dim,
+                float scale, const float *mask) {
+    // Grouped Query Attention
+    // n_heads query heads share n_kv_heads KV heads
+    int heads_per_group = n_heads / n_kv_heads;
+
+    for (int h = 0; h < n_heads; h++) {
+        // Determine which KV head this query head uses
+        int kv_head = h / heads_per_group;
+
+        // Compute attention for this head
+        gemma3_attention_single(
+            output + h * head_dim,
+            q + h * head_dim,
+            k_cache + kv_head * seq_len * head_dim,
+            v_cache + kv_head * seq_len * head_dim,
+            seq_len, head_dim, scale, mask
+        );
+    }
+}
+
+void gemma3_sliding_window_mask(float *mask, int query_pos, int window_size) {
+    // Create mask for sliding window attention
+    // Positions outside the window get -inf
+    int start = (query_pos >= window_size) ? query_pos - window_size + 1 : 0;
+
+    for (int i = 0; i <= query_pos; i++) {
+        if (i >= start) {
+            mask[i] = 0.0f;  // Within window
+        } else {
+            mask[i] = -INFINITY;  // Outside window
+        }
+    }
+}
+
+void gemma3_causal_mask(float *mask, int seq_len, int query_pos) {
+    // Create causal mask: can only attend to positions <= query_pos
+    for (int i = 0; i < seq_len; i++) {
+        if (i <= query_pos) {
+            mask[i] = 0.0f;
+        } else {
+            mask[i] = -INFINITY;
+        }
+    }
+}
+
+/* ============================================================================
+ * Data Type Conversions
+ * ========================================================================== */
+
+void gemma3_bf16_to_f32(float *f32, const uint16_t *bf16, int n) {
+    for (int i = 0; i < n; i++) {
+        f32[i] = gemma3_bf16_to_f32_single(bf16[i]);
+    }
+}
+
+void gemma3_f32_to_bf16(uint16_t *bf16, const float *f32, int n) {
+    for (int i = 0; i < n; i++) {
+        bf16[i] = gemma3_f32_to_bf16_single(f32[i]);
+    }
+}
+
+/* ============================================================================
+ * Sampling Operations
+ * ========================================================================== */
+
+void gemma3_apply_temperature(float *logits, int vocab_size, float temperature) {
+    if (temperature <= 0.0f) return;  // Avoid division by zero
+
+    float inv_temp = 1.0f / temperature;
+    for (int i = 0; i < vocab_size; i++) {
+        logits[i] *= inv_temp;
+    }
+}
+
+// Comparison function for qsort (descending order)
+typedef struct {
+    float value;
+    int index;
+} IndexedFloat;
+
+static int compare_indexed_float_desc(const void *a, const void *b) {
+    float va = ((const IndexedFloat *)a)->value;
+    float vb = ((const IndexedFloat *)b)->value;
+    if (va > vb) return -1;
+    if (va < vb) return 1;
+    return 0;
+}
+
+void gemma3_topk_filter(float *logits, int vocab_size, int k) {
+    if (k <= 0 || k >= vocab_size) return;
+
+    // Create indexed array
+    IndexedFloat *indexed = (IndexedFloat *)malloc(vocab_size * sizeof(IndexedFloat));
+    if (!indexed) return;
+
+    for (int i = 0; i < vocab_size; i++) {
+        indexed[i].value = logits[i];
+        indexed[i].index = i;
+    }
+
+    // Sort by value descending
+    qsort(indexed, vocab_size, sizeof(IndexedFloat), compare_indexed_float_desc);
+
+    // Find threshold (k-th largest value)
+    float threshold = indexed[k - 1].value;
+
+    // Set logits below threshold to -inf
+    for (int i = 0; i < vocab_size; i++) {
+        if (logits[i] < threshold) {
+            logits[i] = -INFINITY;
+        }
+    }
+
+    free(indexed);
+}
+
+void gemma3_topp_filter(float *logits, int vocab_size, float p) {
+    if (p <= 0.0f || p >= 1.0f) return;
+
+    // Create indexed array
+    IndexedFloat *indexed = (IndexedFloat *)malloc(vocab_size * sizeof(IndexedFloat));
+    if (!indexed) return;
+
+    // First apply softmax to get probabilities
+    float *probs = (float *)malloc(vocab_size * sizeof(float));
+    if (!probs) {
+        free(indexed);
+        return;
+    }
+
+    gemma3_softmax(probs, logits, vocab_size);
+
+    for (int i = 0; i < vocab_size; i++) {
+        indexed[i].value = probs[i];
+        indexed[i].index = i;
+    }
+
+    // Sort by probability descending
+    qsort(indexed, vocab_size, sizeof(IndexedFloat), compare_indexed_float_desc);
+
+    // Find cutoff point
+    float cumsum = 0.0f;
+    int cutoff = vocab_size;
+    for (int i = 0; i < vocab_size; i++) {
+        cumsum += indexed[i].value;
+        if (cumsum > p) {
+            cutoff = i + 1;
+            break;
+        }
+    }
+
+    // Create set of indices to keep
+    int *keep = (int *)calloc(vocab_size, sizeof(int));
+    if (!keep) {
+        free(indexed);
+        free(probs);
+        return;
+    }
+
+    for (int i = 0; i < cutoff; i++) {
+        keep[indexed[i].index] = 1;
+    }
+
+    // Set non-kept logits to -inf
+    for (int i = 0; i < vocab_size; i++) {
+        if (!keep[i]) {
+            logits[i] = -INFINITY;
+        }
+    }
+
+    free(indexed);
+    free(probs);
+    free(keep);
+}
+
+int gemma3_sample(const float *probs, int vocab_size) {
+    float r = gemma3_random();
+    float cumsum = 0.0f;
+
+    for (int i = 0; i < vocab_size; i++) {
+        cumsum += probs[i];
+        if (r < cumsum) {
+            return i;
+        }
+    }
+
+    // Fallback to last token (shouldn't happen with proper probs)
+    return vocab_size - 1;
+}
+
+int gemma3_argmax(const float *x, int n) {
+    int max_idx = 0;
+    float max_val = x[0];
+
+    for (int i = 1; i < n; i++) {
+        if (x[i] > max_val) {
+            max_val = x[i];
+            max_idx = i;
+        }
+    }
+
+    return max_idx;
+}
+
+/* ============================================================================
+ * Utility Functions
+ * ========================================================================== */
+
+float gemma3_vec_sum(const float *x, int n) {
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sum += x[i];
+    }
+    return sum;
+}
+
+float gemma3_vec_max(const float *x, int n) {
+    float max_val = x[0];
+    for (int i = 1; i < n; i++) {
+        if (x[i] > max_val) max_val = x[i];
+    }
+    return max_val;
+}
+
+float gemma3_dot(const float *a, const float *b, int n) {
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+void gemma3_set_seed(uint64_t seed) {
+    g_rng_state = seed;
+}
+
+float gemma3_random(void) {
+    // xorshift64* algorithm
+    g_rng_state ^= g_rng_state >> 12;
+    g_rng_state ^= g_rng_state << 25;
+    g_rng_state ^= g_rng_state >> 27;
+    uint64_t result = g_rng_state * 0x2545F4914F6CDD1DULL;
+
+    // Convert to float in [0, 1)
+    return (float)(result >> 11) * (1.0f / 9007199254740992.0f);
+}
