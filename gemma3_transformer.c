@@ -19,23 +19,25 @@
  * Internal Structures (shared with gemma3.c)
  * ========================================================================== */
 
-/* Forward declarations from safetensors */
+/* Forward declarations from safetensors - BF16 weights */
 typedef struct {
-    float *embed_tokens;
+    const uint16_t *embed_tokens;
     struct {
-        float *input_layernorm;
-        float *q_proj;
-        float *k_proj;
-        float *v_proj;
-        float *o_proj;
-        float *post_attention_layernorm;
-        float *gate_proj;
-        float *up_proj;
-        float *down_proj;
-        float *pre_feedforward_layernorm;
-        float *post_feedforward_layernorm;
+        const uint16_t *input_layernorm;
+        const uint16_t *q_proj;
+        const uint16_t *k_proj;
+        const uint16_t *v_proj;
+        const uint16_t *o_proj;
+        const uint16_t *q_norm;  /* QK normalization */
+        const uint16_t *k_norm;  /* QK normalization */
+        const uint16_t *post_attention_layernorm;
+        const uint16_t *gate_proj;
+        const uint16_t *up_proj;
+        const uint16_t *down_proj;
+        const uint16_t *pre_feedforward_layernorm;
+        const uint16_t *post_feedforward_layernorm;
     } layers[GEMMA3_NUM_LAYERS];
-    float *norm;
+    const uint16_t *norm;
 } gemma3_weights_t;
 
 /* KV Cache for a single layer */
@@ -212,10 +214,12 @@ static void cache_kv(layer_kv_cache *cache, const float *k, const float *v,
 static void layer_attention(
     float *output,           /* [hidden_size] */
     const float *x,          /* [hidden_size] - input */
-    const float *q_weight,   /* [num_heads * head_dim, hidden_size] */
-    const float *k_weight,   /* [num_kv_heads * head_dim, hidden_size] */
-    const float *v_weight,   /* [num_kv_heads * head_dim, hidden_size] */
-    const float *o_weight,   /* [hidden_size, num_heads * head_dim] */
+    const uint16_t *q_weight,   /* [num_heads * head_dim, hidden_size] BF16 */
+    const uint16_t *k_weight,   /* [num_kv_heads * head_dim, hidden_size] BF16 */
+    const uint16_t *v_weight,   /* [num_kv_heads * head_dim, hidden_size] BF16 */
+    const uint16_t *o_weight,   /* [hidden_size, num_heads * head_dim] BF16 */
+    const uint16_t *q_norm,     /* [head_dim] BF16 - QK normalization */
+    const uint16_t *k_norm,     /* [head_dim] BF16 - QK normalization */
     layer_kv_cache *cache,
     float *q_buf,            /* [num_heads * head_dim] */
     float *k_buf,            /* [num_kv_heads * head_dim] */
@@ -234,10 +238,22 @@ static void layer_attention(
     int q_size = num_heads * head_dim;
     int kv_size = num_kv_heads * head_dim;
 
-    /* Project Q, K, V */
-    gemma3_matvec(q_buf, q_weight, x, q_size, hidden_size);
-    gemma3_matvec(k_buf, k_weight, x, kv_size, hidden_size);
-    gemma3_matvec(v_buf, v_weight, x, kv_size, hidden_size);
+    /* Project Q, K, V (BF16 weights) */
+    gemma3_matvec_bf16(q_buf, q_weight, x, q_size, hidden_size);
+    gemma3_matvec_bf16(k_buf, k_weight, x, kv_size, hidden_size);
+    gemma3_matvec_bf16(v_buf, v_weight, x, kv_size, hidden_size);
+
+    /* Apply QK normalization (per-head RMSNorm with BF16 weights) */
+    if (q_norm && k_norm) {
+        for (int h = 0; h < num_heads; h++) {
+            gemma3_rmsnorm_bf16(q_buf + h * head_dim, q_buf + h * head_dim,
+                                q_norm, head_dim, cfg->rmsnorm_eps);
+        }
+        for (int h = 0; h < num_kv_heads; h++) {
+            gemma3_rmsnorm_bf16(k_buf + h * head_dim, k_buf + h * head_dim,
+                                k_norm, head_dim, cfg->rmsnorm_eps);
+        }
+    }
 
     /* Apply RoPE */
     int is_global = gemma3_is_global_layer(layer_idx);
@@ -283,8 +299,8 @@ static void layer_attention(
                num_heads, num_kv_heads, seq_len, head_dim,
                scale, mask_buf);
 
-    /* Output projection */
-    gemma3_matvec(output, o_weight, attn_buf, hidden_size, q_size);
+    /* Output projection (BF16 weights) */
+    gemma3_matvec_bf16(output, o_weight, attn_buf, hidden_size, q_size);
 }
 
 /* ============================================================================
@@ -294,9 +310,9 @@ static void layer_attention(
 static void layer_mlp(
     float *output,            /* [hidden_size] */
     const float *x,           /* [hidden_size] */
-    const float *gate_weight, /* [intermediate_size, hidden_size] */
-    const float *up_weight,   /* [intermediate_size, hidden_size] */
-    const float *down_weight, /* [hidden_size, intermediate_size] */
+    const uint16_t *gate_weight, /* [intermediate_size, hidden_size] BF16 */
+    const uint16_t *up_weight,   /* [intermediate_size, hidden_size] BF16 */
+    const uint16_t *down_weight, /* [hidden_size, intermediate_size] BF16 */
     float *gate_buf,          /* [intermediate_size] */
     float *up_buf,            /* [intermediate_size] */
     const gemma3_config *cfg
@@ -304,17 +320,17 @@ static void layer_mlp(
     int hidden_size = cfg->hidden_size;
     int intermediate_size = cfg->intermediate_size;
 
-    /* Gate and up projections */
-    gemma3_matvec(gate_buf, gate_weight, x, intermediate_size, hidden_size);
-    gemma3_matvec(up_buf, up_weight, x, intermediate_size, hidden_size);
+    /* Gate and up projections (BF16 weights) */
+    gemma3_matvec_bf16(gate_buf, gate_weight, x, intermediate_size, hidden_size);
+    gemma3_matvec_bf16(up_buf, up_weight, x, intermediate_size, hidden_size);
 
     /* SwiGLU: gate = SiLU(gate) * up */
     /* Gemma 3 uses GELU instead of SiLU for the gate */
     gemma3_gelu_tanh_inplace(gate_buf, intermediate_size);
     gemma3_vec_mul(gate_buf, gate_buf, up_buf, intermediate_size);
 
-    /* Down projection */
-    gemma3_matvec(output, down_weight, gate_buf, hidden_size, intermediate_size);
+    /* Down projection (BF16 weights) */
+    gemma3_matvec_bf16(output, down_weight, gate_buf, hidden_size, intermediate_size);
 }
 
 /* ============================================================================
@@ -334,8 +350,9 @@ int gemma3_transformer_forward(
     int hidden_size = cfg->hidden_size;
     int vocab_size = cfg->vocab_size;
 
-    /* Token embedding lookup */
-    const float *embed = weights->embed_tokens + token_id * hidden_size;
+    /* Token embedding lookup (BF16) */
+    gemma3_embed_bf16(buf->x, weights->embed_tokens, token_id, hidden_size);
+    const float *embed = buf->x;  /* buf->x now contains the F32 embedding */
 
     /* Gemma scales embeddings by sqrt(hidden_size) */
     float embed_scale = sqrtf((float)hidden_size);
@@ -345,38 +362,41 @@ int gemma3_transformer_forward(
 
     /* Process each layer */
     for (int l = 0; l < cfg->num_layers; l++) {
-        const float *layer_weights_input_ln = weights->layers[l].input_layernorm;
-        const float *layer_weights_q = weights->layers[l].q_proj;
-        const float *layer_weights_k = weights->layers[l].k_proj;
-        const float *layer_weights_v = weights->layers[l].v_proj;
-        const float *layer_weights_o = weights->layers[l].o_proj;
-        const float *layer_weights_post_attn_ln = weights->layers[l].post_attention_layernorm;
-        const float *layer_weights_gate = weights->layers[l].gate_proj;
-        const float *layer_weights_up = weights->layers[l].up_proj;
-        const float *layer_weights_down = weights->layers[l].down_proj;
-        const float *layer_weights_pre_ff_ln = weights->layers[l].pre_feedforward_layernorm;
-        const float *layer_weights_post_ff_ln = weights->layers[l].post_feedforward_layernorm;
+        const uint16_t *layer_weights_input_ln = weights->layers[l].input_layernorm;
+        const uint16_t *layer_weights_q = weights->layers[l].q_proj;
+        const uint16_t *layer_weights_k = weights->layers[l].k_proj;
+        const uint16_t *layer_weights_v = weights->layers[l].v_proj;
+        const uint16_t *layer_weights_o = weights->layers[l].o_proj;
+        const uint16_t *layer_weights_q_norm = weights->layers[l].q_norm;
+        const uint16_t *layer_weights_k_norm = weights->layers[l].k_norm;
+        const uint16_t *layer_weights_post_attn_ln = weights->layers[l].post_attention_layernorm;
+        const uint16_t *layer_weights_gate = weights->layers[l].gate_proj;
+        const uint16_t *layer_weights_up = weights->layers[l].up_proj;
+        const uint16_t *layer_weights_down = weights->layers[l].down_proj;
+        const uint16_t *layer_weights_pre_ff_ln = weights->layers[l].pre_feedforward_layernorm;
+        const uint16_t *layer_weights_post_ff_ln = weights->layers[l].post_feedforward_layernorm;
 
         /* === Self-Attention Block === */
 
-        /* Pre-attention RMSNorm */
-        gemma3_rmsnorm(buf->x_norm, buf->x, layer_weights_input_ln,
-                       hidden_size, cfg->rmsnorm_eps);
+        /* Pre-attention RMSNorm (BF16 weights) */
+        gemma3_rmsnorm_bf16(buf->x_norm, buf->x, layer_weights_input_ln,
+                            hidden_size, cfg->rmsnorm_eps);
 
         /* Attention */
         layer_attention(
             buf->proj_out,
             buf->x_norm,
             layer_weights_q, layer_weights_k, layer_weights_v, layer_weights_o,
+            layer_weights_q_norm, layer_weights_k_norm,
             &cache->layers[l],
             buf->q, buf->k, buf->v, buf->attn_out, buf->mask,
             cfg, l, pos
         );
 
-        /* Post-attention RMSNorm (Gemma 3 specific) */
+        /* Post-attention RMSNorm (Gemma 3 specific, BF16 weights) */
         if (layer_weights_post_attn_ln) {
-            gemma3_rmsnorm_inplace(buf->proj_out, layer_weights_post_attn_ln,
-                                   hidden_size, cfg->rmsnorm_eps);
+            gemma3_rmsnorm_bf16_inplace(buf->proj_out, layer_weights_post_attn_ln,
+                                        hidden_size, cfg->rmsnorm_eps);
         }
 
         /* Residual connection */
@@ -384,10 +404,10 @@ int gemma3_transformer_forward(
 
         /* === MLP Block === */
 
-        /* Pre-feedforward RMSNorm (Gemma 3 specific) */
+        /* Pre-feedforward RMSNorm (Gemma 3 specific, BF16 weights) */
         if (layer_weights_pre_ff_ln) {
-            gemma3_rmsnorm(buf->x_norm, buf->x, layer_weights_pre_ff_ln,
-                           hidden_size, cfg->rmsnorm_eps);
+            gemma3_rmsnorm_bf16(buf->x_norm, buf->x, layer_weights_pre_ff_ln,
+                                hidden_size, cfg->rmsnorm_eps);
         } else {
             gemma3_vec_copy(buf->x_norm, buf->x, hidden_size);
         }
@@ -401,22 +421,22 @@ int gemma3_transformer_forward(
             cfg
         );
 
-        /* Post-feedforward RMSNorm (Gemma 3 specific) */
+        /* Post-feedforward RMSNorm (Gemma 3 specific, BF16 weights) */
         if (layer_weights_post_ff_ln) {
-            gemma3_rmsnorm_inplace(buf->mlp_out, layer_weights_post_ff_ln,
-                                   hidden_size, cfg->rmsnorm_eps);
+            gemma3_rmsnorm_bf16_inplace(buf->mlp_out, layer_weights_post_ff_ln,
+                                        hidden_size, cfg->rmsnorm_eps);
         }
 
         /* Residual connection */
         gemma3_vec_add(buf->x, buf->x, buf->mlp_out, hidden_size);
     }
 
-    /* Final RMSNorm */
-    gemma3_rmsnorm(buf->x_norm, buf->x, weights->norm, hidden_size, cfg->rmsnorm_eps);
+    /* Final RMSNorm (BF16 weights) */
+    gemma3_rmsnorm_bf16(buf->x_norm, buf->x, weights->norm, hidden_size, cfg->rmsnorm_eps);
 
-    /* Output projection (tied embeddings) */
+    /* Output projection (tied embeddings, BF16) */
     /* logits = x_norm @ embed_tokens.T */
-    gemma3_matvec(logits, weights->embed_tokens, buf->x_norm, vocab_size, hidden_size);
+    gemma3_matvec_bf16(logits, weights->embed_tokens, buf->x_norm, vocab_size, hidden_size);
 
     return 0;
 }

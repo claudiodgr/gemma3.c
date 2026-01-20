@@ -33,10 +33,10 @@ extern "C" {
  * Model Configuration Constants
  * ========================================================================== */
 
-#define GEMMA3_VOCAB_SIZE       262144
-#define GEMMA3_HIDDEN_SIZE      2304
-#define GEMMA3_INTERMEDIATE_SIZE 9216
-#define GEMMA3_NUM_LAYERS       26
+#define GEMMA3_VOCAB_SIZE       262208
+#define GEMMA3_HIDDEN_SIZE      2560
+#define GEMMA3_INTERMEDIATE_SIZE 10240
+#define GEMMA3_NUM_LAYERS       34
 #define GEMMA3_NUM_HEADS        8
 #define GEMMA3_NUM_KV_HEADS     4
 #define GEMMA3_HEAD_DIM         256
@@ -341,7 +341,7 @@ const char *gemma3_version(void);
  * @return 1 if global attention, 0 if local (sliding window)
  */
 static inline int gemma3_is_global_layer(int layer_idx) {
-    // Global every 6th layer: layers 5, 11, 17, 23 (0-indexed)
+    // Global every 6th layer: layers 5, 11, 17, 23, 29 (0-indexed)
     return ((layer_idx + 1) % 6 == 0);
 }
 

@@ -113,6 +113,69 @@ void gemma3_rmsnorm_inplace(float *x, const float *weight, int n, float eps) {
 }
 
 /* ============================================================================
+ * BF16 Kernel Operations
+ * ========================================================================== */
+
+/* Helper: Convert BF16 to F32 inline */
+static inline float bf16_to_f32(uint16_t bf16) {
+    uint32_t bits = ((uint32_t)bf16) << 16;
+    float result;
+    __builtin_memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+void gemma3_matvec_bf16(float *y, const uint16_t *A, const float *x, int M, int K) {
+    // y[i] = sum_k A[i,k] * x[k], where A is in BF16
+    for (int i = 0; i < M; i++) {
+        float sum = 0.0f;
+        const uint16_t *row = A + i * K;
+        for (int k = 0; k < K; k++) {
+            sum += bf16_to_f32(row[k]) * x[k];
+        }
+        y[i] = sum;
+    }
+}
+
+void gemma3_rmsnorm_bf16(float *y, const float *x, const uint16_t *weight,
+                         int n, float eps) {
+    // Compute mean of squares
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) {
+        ss += x[i] * x[i];
+    }
+    ss = ss / n + eps;
+    float rsqrt_ss = 1.0f / sqrtf(ss);
+
+    // Normalize and scale (weight is BF16)
+    for (int i = 0; i < n; i++) {
+        y[i] = x[i] * rsqrt_ss * bf16_to_f32(weight[i]);
+    }
+}
+
+void gemma3_rmsnorm_bf16_inplace(float *x, const uint16_t *weight, int n, float eps) {
+    // Compute mean of squares
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) {
+        ss += x[i] * x[i];
+    }
+    ss = ss / n + eps;
+    float rsqrt_ss = 1.0f / sqrtf(ss);
+
+    // Normalize and scale in-place (weight is BF16)
+    for (int i = 0; i < n; i++) {
+        x[i] = x[i] * rsqrt_ss * bf16_to_f32(weight[i]);
+    }
+}
+
+void gemma3_embed_bf16(float *output, const uint16_t *embed, int token_id, int hidden_size) {
+    // Copy embedding row, converting from BF16 to F32
+    const uint16_t *row = embed + token_id * hidden_size;
+    for (int i = 0; i < hidden_size; i++) {
+        output[i] = bf16_to_f32(row[i]);
+    }
+}
+
+/* ============================================================================
  * Activation Functions
  * ========================================================================== */
 

@@ -198,6 +198,36 @@ void gemma3_sliding_window_mask(float *mask, int query_pos, int window_size);
 void gemma3_causal_mask(float *mask, int seq_len, int query_pos);
 
 /* ============================================================================
+ * BF16 Kernel Operations (for memory-efficient inference)
+ * ========================================================================== */
+
+/**
+ * Matrix-vector multiplication with BF16 matrix: y = A @ x
+ * A: [M, K] in BF16, x: [K] in F32, y: [M] in F32
+ * Converts BF16 to F32 on-the-fly during computation
+ */
+void gemma3_matvec_bf16(float *y, const uint16_t *A, const float *x, int M, int K);
+
+/**
+ * RMS Normalization with BF16 weights: y = x * rsqrt(mean(x^2) + eps) * weight
+ * x: [n] in F32, weight: [n] in BF16, y: [n] in F32
+ */
+void gemma3_rmsnorm_bf16(float *y, const float *x, const uint16_t *weight,
+                         int n, float eps);
+
+/**
+ * RMS Normalization in-place with BF16 weights
+ */
+void gemma3_rmsnorm_bf16_inplace(float *x, const uint16_t *weight, int n, float eps);
+
+/**
+ * Embedding lookup from BF16 table
+ * embed: [vocab_size, hidden_size] in BF16
+ * output: [hidden_size] in F32
+ */
+void gemma3_embed_bf16(float *output, const uint16_t *embed, int token_id, int hidden_size);
+
+/* ============================================================================
  * Data Type Conversions
  * ========================================================================== */
 
