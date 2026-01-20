@@ -1,5 +1,7 @@
 # gemma3.c
 
+> **⚠️ Work in Progress**: This project is under active development. Inference output may not be fully accurate yet. Contributions and bug reports are welcome!
+
 Pure C inference implementation for Google's Gemma 3 4B IT model.
 
 ## Features
@@ -33,7 +35,7 @@ make
 
 - C11-compatible compiler (GCC, Clang)
 - POSIX system (Linux, macOS)
-- ~8GB RAM for inference
+- ~3-4GB RAM for inference
 
 ### Build Options
 
@@ -118,10 +120,10 @@ gemma3_free(ctx);
 
 | Parameter | Value |
 |-----------|-------|
-| Vocabulary | 262,144 tokens |
-| Hidden size | 2,304 |
-| Intermediate size | 9,216 |
-| Layers | 26 |
+| Vocabulary | 262,208 tokens |
+| Hidden size | 2,560 |
+| Intermediate size | 10,240 |
+| Layers | 34 |
 | Attention heads | 8 |
 | KV heads | 4 (GQA) |
 | Head dimension | 256 |
@@ -147,17 +149,18 @@ gemma3.c/
 
 ## Memory Usage
 
+Weights are kept in BF16 format (memory-mapped directly from safetensors files) and converted to F32 on-the-fly during computation, minimizing memory usage.
+
 | Component | Size |
 |-----------|------|
-| Weights (BF16) | ~2.2 GB |
-| Weights (F32, loaded) | ~4.3 GB |
-| KV cache (8K context) | ~450 MB |
+| Weights (BF16 mmap'd) | ~8 GB (on disk) |
+| KV cache (1K context) | ~70 MB |
 | Activations | ~100 MB |
-| **Total** | **~7 GB** |
+| **Total RAM** | **~3 GB** |
 
 For lower memory usage, consider reducing context size with `-c`:
 ```bash
-./gemma3 -m ./gemma-3-4b-it -c 4096 -p "Your prompt"
+./gemma3 -m ./gemma-3-4b-it -c 512 -p "Your prompt"
 ```
 
 ## Performance
@@ -175,13 +178,14 @@ For better performance:
 
 ### Attention Pattern
 
-Gemma 3 uses a hybrid attention pattern:
-- **Local layers** (layers 0-4, 6-10, 12-16, 18-22, 24-25): Sliding window attention with 1,024 token window, RoPE theta=10,000
-- **Global layers** (layers 5, 11, 17, 23): Full attention, RoPE theta=1,000,000
+Gemma 3 uses a hybrid attention pattern (every 6th layer is global):
+- **Local layers**: Sliding window attention with 1,024 token window, RoPE theta=10,000
+- **Global layers** (layers 5, 11, 17, 23, 29): Full attention, RoPE theta=1,000,000
 
 ### Normalization
 
 - RMSNorm with epsilon=1e-6
+- QK normalization (per-head RMSNorm on Q and K before RoPE)
 - Additional pre/post feedforward layer norms (Gemma 3 specific)
 
 ### MLP
