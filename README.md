@@ -58,6 +58,9 @@ huggingface-cli download google/gemma-3-4b-it --local-dir ./gemma-3-4b-it
 # Or using git-lfs
 git lfs install
 git clone https://huggingface.co/google/gemma-3-4b-it
+
+#Or using the python script (recommended)
+python download_model.py (rembember to set your HF_TOKEN or pass directly when running the script by including the --token flag)
 ```
 
 The model directory should contain:
