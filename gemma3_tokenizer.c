@@ -25,8 +25,8 @@
 #define GEMMA3_TOKEN_UNK 3
 
 /* Chat template tokens */
-#define GEMMA3_TOKEN_START_TURN 106  /* <start_of_turn> */
-#define GEMMA3_TOKEN_END_TURN 107    /* <end_of_turn> */
+#define GEMMA3_TOKEN_START_TURN 105  /* <start_of_turn> */
+#define GEMMA3_TOKEN_END_TURN 106    /* <end_of_turn> */
 
 /* ============================================================================
  * Data Structures
@@ -608,6 +608,14 @@ int gemma3_eos_token(gemma3_tokenizer *tok) {
 
 int gemma3_pad_token(gemma3_tokenizer *tok) {
     return tok ? tok->pad_id : GEMMA3_TOKEN_PAD;
+}
+
+int gemma3_end_turn_token(gemma3_tokenizer *tok) {
+    return tok ? tok->end_turn_id : GEMMA3_TOKEN_END_TURN;
+}
+
+int gemma3_start_turn_token(gemma3_tokenizer *tok) {
+    return tok ? tok->start_turn_id : GEMMA3_TOKEN_START_TURN;
 }
 
 /* ============================================================================
