@@ -65,6 +65,7 @@ endif
 # Check for THREADS in the mode string
 ifneq (,$(findstring threads,$(MODE)))
     CFLAGS += $(CFLAGS_FAST) -DUSE_THREADS
+    LDFLAGS += -lpthread
     SRCS += gemma3_threads.c
 endif
 
