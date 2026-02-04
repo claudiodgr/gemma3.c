@@ -25,6 +25,7 @@
 
 ```bash
 export HF_TOKEN=your_token_here
+pip install huggingface_hub
 python download_model.py
 ```
 
