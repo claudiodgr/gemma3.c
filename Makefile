@@ -7,7 +7,10 @@
 #   make blas           - Build with OpenBLAS
 #   make threads        - Build with thread pool
 #   make blas-threads   - Build with OpenBLAS + thread pool
+#   make webgpu         - Build with WebGPU acceleration
+#   make webgpu-threads - Build with WebGPU + thread pool
 #   make clean          - Remove all build artifacts
+#   make shaders        - Generate embedded shader source
 
 # --- Configuration ---
 
@@ -69,6 +72,19 @@ ifneq (,$(findstring threads,$(MODE)))
     SRCS += gemma3_threads.c
 endif
 
+# Check for WEBGPU in the mode string
+ifneq (,$(findstring webgpu,$(MODE)))
+    CFLAGS += $(CFLAGS_FAST) -DUSE_WEBGPU
+    # Link against wgpu-native library
+    # Adjust paths as needed for your system
+    WGPU_DIR ?= /usr/local
+    CFLAGS += -I$(WGPU_DIR)/include
+    LDFLAGS += -L$(WGPU_DIR)/lib -lwgpu_native
+    # On Linux, also need these
+    LDFLAGS += -ldl -lpthread
+    SRCS += gemma3_webgpu.c
+endif
+
 # Calculate Objects based on the current MODE
 # Result: build/blas-threads/gemma3.o, etc.
 OBJS = $(patsubst %.c, $(BUILD_DIR)/$(MODE)/%.o, $(SRCS))
@@ -76,7 +92,7 @@ OBJS = $(patsubst %.c, $(BUILD_DIR)/$(MODE)/%.o, $(SRCS))
 # --- Convenience Targets ---
 # These targets just re-run make with a specific MODE
 
-.PHONY: all debug fast blas threads blas-threads clean help
+.PHONY: all debug fast blas threads blas-threads webgpu webgpu-threads clean help shaders
 
 all:
 	@$(MAKE) --no-print-directory build_core MODE=release
@@ -95,6 +111,22 @@ threads:
 
 blas-threads:
 	@$(MAKE) --no-print-directory build_core MODE=blas-threads
+
+webgpu:
+	@$(MAKE) --no-print-directory build_core MODE=webgpu
+
+webgpu-threads:
+	@$(MAKE) --no-print-directory build_core MODE=webgpu-threads
+
+# --- Shader Embedding ---
+
+shaders: shaders/gemma3_kernels.wgsl
+	@echo "Generating embedded shader source..."
+	@echo '// Auto-generated - do not edit' > shaders/gemma3_kernels.wgsl.inc
+	@echo '"\\' >> shaders/gemma3_kernels.wgsl.inc
+	@sed 's/"/\\"/g; s/$$/\\n\\/; s/\t/    /g' shaders/gemma3_kernels.wgsl >> shaders/gemma3_kernels.wgsl.inc
+	@echo '"' >> shaders/gemma3_kernels.wgsl.inc
+	@echo "Shader source embedded in shaders/gemma3_kernels.wgsl.inc"
 
 # --- The Real Build Target ---
 
@@ -126,3 +158,10 @@ help:
 	@echo "  make blas         : OpenBLAS"
 	@echo "  make threads      : Thread pool"
 	@echo "  make blas-threads : OpenBLAS + Threads"
+	@echo "  make webgpu       : WebGPU acceleration"
+	@echo "  make webgpu-threads: WebGPU + Threads"
+	@echo "  make shaders      : Generate embedded shader source"
+	@echo ""
+	@echo "WebGPU Notes:"
+	@echo "  Requires wgpu-native library. Set WGPU_DIR to installation path."
+	@echo "  Example: make webgpu WGPU_DIR=/opt/wgpu"

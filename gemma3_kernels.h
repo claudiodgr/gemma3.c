@@ -19,6 +19,10 @@
 #include "gemma3_threads.h"
 #endif
 
+#ifdef USE_WEBGPU
+#include "gemma3_webgpu.h"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
