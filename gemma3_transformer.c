@@ -14,20 +14,56 @@
 #ifdef USE_THREADS
 #include "gemma3_threads.h"
 #endif
+#ifdef USE_WEBGPU
+#include "gemma3_webgpu.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
-/* Helper to dispatch matvec_bf16 to threaded or single-threaded path */
+/*
+ * Helper to dispatch matvec_bf16 to WebGPU, threaded, or single-threaded path.
+ *
+ * Priority: WebGPU > Threads > Single-threaded
+ *
+ * Note: For WebGPU, the 'pool' parameter is reused to pass the GPU context.
+ * The caller should set pool to either a gemma3_thread_pool* or gemma3_gpu_context*
+ * depending on the build configuration.
+ */
 static inline void matvec_bf16_dispatch(float *y, const uint16_t *A, const float *x,
                                          int M, int K, float *scratch, void *pool) {
+#ifdef USE_WEBGPU
+    /* WebGPU path: pool is actually a gemma3_gpu_context* */
+    if (pool) {
+        gemma3_gpu_context *gpu = (gemma3_gpu_context *)pool;
+        /* For GPU execution, we use pre-allocated buffers from the context */
+        /* Note: This is a simplified dispatch - full integration would manage
+         * GPU buffers more efficiently without CPU-GPU copies per operation */
+
+        /* Create temporary GPU buffers and execute */
+        gemma3_gpu_buffer y_buf = gemma3_gpu_create_buffer(gpu, M * sizeof(float),
+            WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
+        gemma3_gpu_buffer x_buf = gemma3_gpu_create_buffer(gpu, K * sizeof(float),
+            WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+
+        gemma3_gpu_write_buffer(gpu, &x_buf, x, K * sizeof(float));
+        gemma3_matvec_bf16_gpu(gpu, &y_buf, A, &x_buf, M, K);
+        gemma3_gpu_sync(gpu);
+        gemma3_gpu_read_buffer(gpu, &y_buf, y, M * sizeof(float));
+
+        gemma3_gpu_destroy_buffer(&x_buf);
+        gemma3_gpu_destroy_buffer(&y_buf);
+        return;
+    }
+#endif
 #ifdef USE_THREADS
     if (pool) {
         gemma3_matvec_bf16_mt(y, A, x, M, K, scratch, (gemma3_thread_pool *)pool);
         return;
     }
-#else
+#endif
+#if !defined(USE_WEBGPU) && !defined(USE_THREADS)
     (void)pool;
 #endif
     gemma3_matvec_bf16(y, A, x, M, K, scratch);
