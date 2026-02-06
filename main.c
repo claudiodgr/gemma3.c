@@ -69,6 +69,38 @@ static void signal_handler(int sig) {
  * Streaming Callback
  * ========================================================================== */
 
+/* Stop-string matcher: holds characters that might be part of <end_of_turn>,
+ * only prints them if the match breaks. Since '<' only appears at position 0
+ * of the stop string, no KMP-style backtracking is needed. */
+static const char STOP_STR[] = "<end_of_turn>";
+#define STOP_LEN 13
+static int s_match_pos = 0;
+
+/* Feed one decoded display character through the stop matcher.
+ * Returns 1 if the full stop string was detected (generation should stop).
+ * Characters confirmed not to be part of the stop string are printed. */
+static int feed_display_char(char c) {
+    if (c == STOP_STR[s_match_pos]) {
+        s_match_pos++;
+        if (s_match_pos == STOP_LEN) {
+            s_match_pos = 0;
+            return 1;  /* Full match - stop generation */
+        }
+        return 0;  /* Partial match - hold, don't print yet */
+    }
+    /* Match broken: flush the held prefix chars that turned out to be safe */
+    for (int i = 0; i < s_match_pos; i++)
+        putchar(STOP_STR[i]);
+    s_match_pos = 0;
+    /* Check if current char starts a new match */
+    if (c == STOP_STR[0]) {
+        s_match_pos = 1;
+        return 0;  /* Hold */
+    }
+    putchar(c);
+    return 0;
+}
+
 static int stream_callback(int token_id, const char *token_str, void *user_data) {
     (void)user_data;
 
@@ -81,10 +113,14 @@ static int stream_callback(int token_id, const char *token_str, void *user_data)
         return 0;
     }
 
-    /* Skip control tokens by exact string match */
+    /* Stop on end-of-turn token (exact string match) */
+    if (token_str && strcmp(token_str, "<end_of_turn>") == 0) {
+        return 1;  /* Stop generation */
+    }
+
+    /* Skip other control tokens by exact string match */
     if (token_str && token_str[0] != '\0') {
-        if (strcmp(token_str, "<end_of_turn>") == 0 ||
-            strcmp(token_str, "<start_of_turn>") == 0 ||
+        if (strcmp(token_str, "<start_of_turn>") == 0 ||
             strcmp(token_str, "<bos>") == 0 ||
             strcmp(token_str, "<eos>") == 0 ||
             strcmp(token_str, "<pad>") == 0 ||
@@ -93,29 +129,30 @@ static int stream_callback(int token_id, const char *token_str, void *user_data)
         }
     }
 
-    /* Handle token output */
+    /* Decode token and feed through stop-string matcher */
     if (token_str && token_str[0] != '\0') {
         const char *ptr = token_str;
         while (*ptr) {
-            /* Check for ▁ (0xE2 0x96 0x81) - sentencepiece space marker */
+            char decoded;
+            /* Check for sentencepiece space marker (3-byte UTF-8) */
             if ((unsigned char)ptr[0] == 0xE2 &&
                 (unsigned char)ptr[1] == 0x96 &&
                 (unsigned char)ptr[2] == 0x81) {
-                putchar(' ');
+                decoded = ' ';
                 ptr += 3;
             } else if (ptr[0] == '<' && ptr[1] == '0' && ptr[2] == 'x' &&
                        ptr[3] != '\0' && ptr[4] != '\0' && ptr[5] == '>') {
-                /* Byte token <0xNN> - decode and print the actual byte */
-                unsigned int byte_val;
-                if (sscanf(ptr, "<0x%02X>", &byte_val) == 1 ||
-                    sscanf(ptr, "<0x%02x>", &byte_val) == 1) {
-                    putchar((char)byte_val);
-                }
+                /* Byte token <0xNN> - decode to actual byte */
+                unsigned int byte_val = 0;
+                sscanf(ptr, "<0x%02X>", &byte_val) || sscanf(ptr, "<0x%02x>", &byte_val);
+                decoded = (char)byte_val;
                 ptr += 6;
             } else {
-                /* Regular character - print directly */
-                putchar(*ptr);
-                ptr++;
+                decoded = *ptr++;
+            }
+            if (feed_display_char(decoded)) {
+                fflush(stdout);
+                return 1;  /* Stop string detected */
             }
         }
         fflush(stdout);
@@ -492,6 +529,7 @@ static int run_single_prompt(gemma3_ctx *ctx, const cli_config *config) {
     };
 
     g_interrupted = 0;
+    s_match_pos = 0;
 
     /* Use chat interface to properly format prompt with chat template */
     gemma3_message messages[2];

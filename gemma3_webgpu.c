@@ -17,6 +17,7 @@
 #include <string.h>
 #include <assert.h>
 #include <stdarg.h>
+#include <math.h>
 
 /* ============================================================================
  * WGPUStringView helper
@@ -423,6 +424,17 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
     };
     ctx->gelu_layout = create_bind_group_layout(ctx->device, gelu_entries, 2, "gelu_layout");
 
+    /* Fused GELU+mul layout: params, gate(rw), up(ro) */
+    WGPUBindGroupLayoutEntry gelu_mul_entries[] = {
+        {.binding = 0, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Uniform}},
+        {.binding = 1, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Storage}},
+        {.binding = 2, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage}},
+    };
+    ctx->gelu_mul_layout = create_bind_group_layout(ctx->device, gelu_mul_entries, 3, "gelu_mul_layout");
+
     /* Softmax layout: params, x */
     ctx->softmax_layout = create_bind_group_layout(ctx->device, gelu_entries, 2, "softmax_layout");
 
@@ -481,7 +493,7 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
     /* Create compute pipelines */
     ctx->matvec_bf16_pipeline = create_compute_pipeline(
         ctx->device, ctx->shader_module, ctx->matvec_layout,
-        "matvec_bf16_kernel", "matvec_bf16");
+        "matvec_bf16_kernel_tiled", "matvec_bf16");
 
     ctx->rmsnorm_bf16_pipeline = create_compute_pipeline(
         ctx->device, ctx->shader_module, ctx->rmsnorm_layout,
@@ -490,6 +502,10 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
     ctx->gelu_pipeline = create_compute_pipeline(
         ctx->device, ctx->shader_module, ctx->gelu_layout,
         "gelu_kernel", "gelu");
+
+    ctx->gelu_mul_pipeline = create_compute_pipeline(
+        ctx->device, ctx->shader_module, ctx->gelu_mul_layout,
+        "gelu_mul_kernel", "gelu_mul");
 
     ctx->softmax_pipeline = create_compute_pipeline(
         ctx->device, ctx->shader_module, ctx->softmax_layout,
@@ -515,6 +531,118 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
         ctx->device, ctx->shader_module, ctx->embed_layout,
         "embed_bf16_kernel", "embed_bf16");
 
+    /* In-place RMSNorm pipeline (reuses rmsnorm_layout: reads/writes y buffer) */
+    ctx->rmsnorm_bf16_inplace_pipeline = create_compute_pipeline(
+        ctx->device, ctx->shader_module, ctx->rmsnorm_layout,
+        "rmsnorm_bf16_inplace_kernel", "rmsnorm_bf16_inplace");
+
+    /* --- Phase 2 layouts and pipelines --- */
+
+    /* KV cache write layout: params, k_in, v_in, k_cache, v_cache */
+    WGPUBindGroupLayoutEntry kv_write_entries[] = {
+        {.binding = 0, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Uniform}},
+        {.binding = 1, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage}},
+        {.binding = 2, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage}},
+        {.binding = 3, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Storage}},
+        {.binding = 4, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Storage}},
+    };
+    ctx->kv_cache_write_layout = create_bind_group_layout(ctx->device, kv_write_entries, 5, "kv_cache_write_layout");
+
+    /* Multi-head RMSNorm layout: params, x (rw), weight (read) */
+    WGPUBindGroupLayoutEntry mh_rmsnorm_entries[] = {
+        {.binding = 0, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Uniform}},
+        {.binding = 1, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Storage}},
+        {.binding = 2, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage}},
+    };
+    ctx->multi_head_rmsnorm_layout = create_bind_group_layout(ctx->device, mh_rmsnorm_entries, 3, "multi_head_rmsnorm_layout");
+
+    /* RoPE precomputed layout: params, x (rw), table (read) */
+    WGPUBindGroupLayoutEntry rope_pre_entries[] = {
+        {.binding = 0, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Uniform}},
+        {.binding = 1, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Storage}},
+        {.binding = 2, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage}},
+    };
+    ctx->rope_precomputed_layout = create_bind_group_layout(ctx->device, rope_pre_entries, 3, "rope_precomputed_layout");
+
+    /* Mask layout: params, mask_output (rw) */
+    WGPUBindGroupLayoutEntry mask_entries[] = {
+        {.binding = 0, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Uniform}},
+        {.binding = 1, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Storage}},
+    };
+    ctx->mask_layout = create_bind_group_layout(ctx->device, mask_entries, 2, "mask_layout");
+
+    /* Phase 2 pipelines */
+    ctx->kv_cache_write_pipeline = create_compute_pipeline(
+        ctx->device, ctx->shader_module, ctx->kv_cache_write_layout,
+        "kv_cache_write_kernel", "kv_cache_write");
+
+    ctx->multi_head_rmsnorm_pipeline = create_compute_pipeline(
+        ctx->device, ctx->shader_module, ctx->multi_head_rmsnorm_layout,
+        "multi_head_rmsnorm_bf16_kernel", "multi_head_rmsnorm");
+
+    ctx->rope_precomputed_pipeline = create_compute_pipeline(
+        ctx->device, ctx->shader_module, ctx->rope_precomputed_layout,
+        "rope_precomputed_kernel", "rope_precomputed");
+
+    ctx->sliding_window_mask_pipeline = create_compute_pipeline(
+        ctx->device, ctx->shader_module, ctx->mask_layout,
+        "sliding_window_mask_kernel", "sliding_window_mask");
+
+    ctx->causal_mask_pipeline = create_compute_pipeline(
+        ctx->device, ctx->shader_module, ctx->mask_layout,
+        "causal_mask_kernel", "causal_mask");
+
+    /* --- Phase 3 non-aliasing in-place layouts and pipelines --- */
+
+    /* In-place vec op layout: params (uniform), y (rw), b (ro) */
+    WGPUBindGroupLayoutEntry inplace_vec_entries[] = {
+        {.binding = 0, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Uniform}},
+        {.binding = 1, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Storage}},
+        {.binding = 2, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage}},
+    };
+    ctx->inplace_vec_op_layout = create_bind_group_layout(ctx->device, inplace_vec_entries, 3, "inplace_vec_op_layout");
+
+    /* In-place RMSNorm v2 layout: params (uniform), data (rw), weight (ro), scratch (rw) */
+    WGPUBindGroupLayoutEntry rmsnorm_ip_entries[] = {
+        {.binding = 0, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Uniform}},
+        {.binding = 1, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Storage}},
+        {.binding = 2, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage}},
+        {.binding = 3, .visibility = WGPUShaderStage_Compute,
+         .buffer = {.type = WGPUBufferBindingType_Storage}},
+    };
+    ctx->rmsnorm_inplace_v2_layout = create_bind_group_layout(ctx->device, rmsnorm_ip_entries, 4, "rmsnorm_inplace_v2_layout");
+
+    ctx->vec_add_inplace_pipeline = create_compute_pipeline(
+        ctx->device, ctx->shader_module, ctx->inplace_vec_op_layout,
+        "vec_add_inplace_kernel", "vec_add_inplace");
+
+    ctx->vec_mul_inplace_pipeline = create_compute_pipeline(
+        ctx->device, ctx->shader_module, ctx->inplace_vec_op_layout,
+        "vec_mul_inplace_kernel", "vec_mul_inplace");
+
+    ctx->rmsnorm_bf16_inplace_v2_pipeline = create_compute_pipeline(
+        ctx->device, ctx->shader_module, ctx->rmsnorm_inplace_v2_layout,
+        "rmsnorm_bf16_inplace_v2_kernel", "rmsnorm_bf16_inplace_v2");
+
     /* Set default workgroup sizes */
     ctx->workgroup_size_1d = 256;
     ctx->workgroup_size_2d_x = 16;
@@ -532,7 +660,9 @@ int gemma3_gpu_init_buffers(
     int num_heads,
     int num_kv_heads,
     int head_dim,
-    int max_context
+    int max_context,
+    int num_layers,
+    int sliding_window
 ) {
     ctx->hidden_size = hidden_size;
     ctx->intermediate_size = intermediate_size;
@@ -541,6 +671,7 @@ int gemma3_gpu_init_buffers(
     ctx->num_kv_heads = num_kv_heads;
     ctx->head_dim = head_dim;
     ctx->max_context = max_context;
+    ctx->sliding_window = sliding_window;
 
     WGPUBufferUsage storage_rw = WGPUBufferUsage_Storage |
                                   WGPUBufferUsage_CopyDst |
@@ -572,13 +703,119 @@ int gemma3_gpu_init_buffers(
     ctx->staging_read = gemma3_gpu_create_buffer(ctx, vocab_size * sizeof(float),
                                                   WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead);
 
+    /* --- Phase 1: Params ring buffer (256KB) --- */
+    ctx->params_ring_size = 256 * 1024;
+    ctx->params_ring_offset = 0;
+    ctx->buf_params_ring = gemma3_gpu_create_buffer(ctx, ctx->params_ring_size,
+                                                     WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
+
+    /* --- Phase 1: Reusable per-layer weight buffers --- */
+    /* gate/up/down: [intermediate_size, hidden_size] BF16 = 10240*2560*2 = ~50MB */
+    size_t weight_large_size = (size_t)intermediate_size * hidden_size * sizeof(uint16_t);
+    ctx->buf_weight_large_0 = gemma3_gpu_create_buffer(ctx, weight_large_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+    ctx->buf_weight_large_1 = gemma3_gpu_create_buffer(ctx, weight_large_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+
+    /* q/o projections: q=[num_heads*head_dim, hidden_size], o=[hidden_size, num_heads*head_dim] */
+    size_t weight_medium_size = (size_t)num_heads * head_dim * hidden_size * sizeof(uint16_t);
+    ctx->buf_weight_medium = gemma3_gpu_create_buffer(ctx, weight_medium_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+
+    /* k/v projections: [num_kv_heads*head_dim, hidden_size] BF16 */
+    size_t weight_small_size = (size_t)num_kv_heads * head_dim * hidden_size * sizeof(uint16_t);
+    ctx->buf_weight_small_0 = gemma3_gpu_create_buffer(ctx, weight_small_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+    ctx->buf_weight_small_1 = gemma3_gpu_create_buffer(ctx, weight_small_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+
+    /* layernorm weights: [hidden_size] BF16, also used for head_dim-sized norms */
+    /* Two slots to avoid overwrite when two different norm weights are needed in same batch */
+    size_t weight_norm_size = (size_t)hidden_size * sizeof(uint16_t);
+    ctx->buf_weight_norm_0 = gemma3_gpu_create_buffer(ctx, weight_norm_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+    ctx->buf_weight_norm_1 = gemma3_gpu_create_buffer(ctx, weight_norm_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+
+    /* RMSNorm scratch buffer (256 floats for workgroup reduction) */
+    ctx->buf_rmsnorm_scratch = gemma3_gpu_create_buffer(ctx, 256 * sizeof(float),
+        WGPUBufferUsage_Storage);
+
+    /* --- Phase 2: Additional weight buffers --- */
+    /* Third large buffer for down_proj (all 3 MLP projections in one batch) */
+    ctx->buf_weight_large_2 = gemma3_gpu_create_buffer(ctx, weight_large_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+
+    /* Second medium buffer for o_proj (q_proj uses first medium) */
+    ctx->buf_weight_medium_1 = gemma3_gpu_create_buffer(ctx, weight_medium_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+
+    /* Additional norm buffers (4 total needed: input_ln, post_attn_ln, pre_ff_ln, post_ff_ln) */
+    ctx->buf_weight_norm_2 = gemma3_gpu_create_buffer(ctx, weight_norm_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+    ctx->buf_weight_norm_3 = gemma3_gpu_create_buffer(ctx, weight_norm_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+
+    /* QK normalization weight buffers (head_dim BF16 = 256*2 = 512 bytes) */
+    size_t qk_norm_size = (size_t)head_dim * sizeof(uint16_t);
+    ctx->buf_weight_qk_norm_q = gemma3_gpu_create_buffer(ctx, qk_norm_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+    ctx->buf_weight_qk_norm_k = gemma3_gpu_create_buffer(ctx, qk_norm_size,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+
+    /* --- Phase 2: GPU-resident KV cache --- */
+    {
+        int kv_dim = num_kv_heads * head_dim;
+        int max_layers = num_layers < 34 ? num_layers : 34;
+        ctx->gpu_kv_num_layers = max_layers;
+
+        for (int l = 0; l < max_layers; l++) {
+            /* Global every 6th layer (5,11,17,23,29): full context */
+            /* Local layers: sliding window */
+            int is_global = ((l + 1) % 6 == 0);
+            int layer_max_seq = is_global ? max_context : sliding_window;
+
+            ctx->gpu_kv_cache[l].max_seq = layer_max_seq;
+            size_t kv_cache_size = (size_t)layer_max_seq * kv_dim * sizeof(float);
+
+            ctx->gpu_kv_cache[l].k = gemma3_gpu_create_buffer(ctx, kv_cache_size, storage_rw);
+            ctx->gpu_kv_cache[l].v = gemma3_gpu_create_buffer(ctx, kv_cache_size, storage_rw);
+        }
+    }
+
+    /* --- Phase 2: Precomputed RoPE buffers --- */
+    {
+        size_t rope_table_size = (size_t)max_context * (head_dim / 2) * 2 * sizeof(float);
+        ctx->buf_rope_local = gemma3_gpu_create_buffer(ctx, rope_table_size,
+            WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+        ctx->buf_rope_global = gemma3_gpu_create_buffer(ctx, rope_table_size,
+            WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+    }
+
+    /* --- Phase 2: Resize attn_scores for per-head GQA --- */
+    /* Need num_heads * max_context floats (was just max_context) */
+    gemma3_gpu_destroy_buffer(&ctx->buf_attn_scores);
+    ctx->buf_attn_scores = gemma3_gpu_create_buffer(ctx,
+        (size_t)num_heads * max_context * sizeof(float), storage_rw);
+
+    /* Initialize command encoder state */
+    ctx->active_encoder = NULL;
+    ctx->active_pass = NULL;
+    ctx->encoder_open = 0;
+    ctx->pass_open = 0;
+
     return 0;
 }
 
 void gemma3_gpu_free(gemma3_gpu_context *ctx) {
     if (!ctx) return;
 
-    /* Release buffers */
+    /* Flush any pending commands before cleanup */
+    if (ctx->encoder_open) {
+        gemma3_gpu_flush_commands(ctx);
+    }
+
+    /* Release activation buffers */
     gemma3_gpu_destroy_buffer(&ctx->buf_x);
     gemma3_gpu_destroy_buffer(&ctx->buf_x_norm);
     gemma3_gpu_destroy_buffer(&ctx->buf_q);
@@ -596,10 +833,61 @@ void gemma3_gpu_free(gemma3_gpu_context *ctx) {
     gemma3_gpu_destroy_buffer(&ctx->staging_write);
     gemma3_gpu_destroy_buffer(&ctx->staging_read);
 
+    /* Release Phase 1 buffers */
+    gemma3_gpu_destroy_buffer(&ctx->buf_params_ring);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_large_0);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_large_1);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_medium);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_small_0);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_small_1);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_norm_0);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_norm_1);
+    gemma3_gpu_destroy_buffer(&ctx->buf_rmsnorm_scratch);
+
+    /* Release Phase 2 buffers */
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_large_2);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_medium_1);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_norm_2);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_norm_3);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_qk_norm_q);
+    gemma3_gpu_destroy_buffer(&ctx->buf_weight_qk_norm_k);
+    gemma3_gpu_destroy_buffer(&ctx->buf_rope_local);
+    gemma3_gpu_destroy_buffer(&ctx->buf_rope_global);
+
+    /* Release GPU KV cache */
+    for (int l = 0; l < ctx->gpu_kv_num_layers; l++) {
+        gemma3_gpu_destroy_buffer(&ctx->gpu_kv_cache[l].k);
+        gemma3_gpu_destroy_buffer(&ctx->gpu_kv_cache[l].v);
+    }
+
+    /* Release Phase 3 persistent layer weights */
+    if (ctx->layer_weights) {
+        for (int l = 0; l < ctx->num_weight_layers; l++) {
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].q_proj);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].k_proj);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].v_proj);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].o_proj);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].gate_proj);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].up_proj);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].down_proj);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].input_layernorm);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].post_attn_ln);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].pre_ff_ln);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].post_ff_ln);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].q_norm);
+            gemma3_gpu_destroy_buffer(&ctx->layer_weights[l].k_norm);
+        }
+        free(ctx->layer_weights);
+        ctx->layer_weights = NULL;
+    }
+    gemma3_gpu_destroy_buffer(&ctx->buf_final_norm);
+
     /* Release pipelines */
     if (ctx->matvec_bf16_pipeline) wgpuComputePipelineRelease(ctx->matvec_bf16_pipeline);
     if (ctx->rmsnorm_bf16_pipeline) wgpuComputePipelineRelease(ctx->rmsnorm_bf16_pipeline);
+    if (ctx->rmsnorm_bf16_inplace_pipeline) wgpuComputePipelineRelease(ctx->rmsnorm_bf16_inplace_pipeline);
     if (ctx->gelu_pipeline) wgpuComputePipelineRelease(ctx->gelu_pipeline);
+    if (ctx->gelu_mul_pipeline) wgpuComputePipelineRelease(ctx->gelu_mul_pipeline);
     if (ctx->softmax_pipeline) wgpuComputePipelineRelease(ctx->softmax_pipeline);
     if (ctx->rope_pipeline) wgpuComputePipelineRelease(ctx->rope_pipeline);
     if (ctx->gqa_pipeline) wgpuComputePipelineRelease(ctx->gqa_pipeline);
@@ -607,15 +895,38 @@ void gemma3_gpu_free(gemma3_gpu_context *ctx) {
     if (ctx->vec_mul_pipeline) wgpuComputePipelineRelease(ctx->vec_mul_pipeline);
     if (ctx->embed_bf16_pipeline) wgpuComputePipelineRelease(ctx->embed_bf16_pipeline);
 
+    /* Release Phase 2 pipelines */
+    if (ctx->kv_cache_write_pipeline) wgpuComputePipelineRelease(ctx->kv_cache_write_pipeline);
+    if (ctx->multi_head_rmsnorm_pipeline) wgpuComputePipelineRelease(ctx->multi_head_rmsnorm_pipeline);
+    if (ctx->rope_precomputed_pipeline) wgpuComputePipelineRelease(ctx->rope_precomputed_pipeline);
+    if (ctx->sliding_window_mask_pipeline) wgpuComputePipelineRelease(ctx->sliding_window_mask_pipeline);
+    if (ctx->causal_mask_pipeline) wgpuComputePipelineRelease(ctx->causal_mask_pipeline);
+
+    /* Release Phase 3 non-aliasing pipelines */
+    if (ctx->vec_add_inplace_pipeline) wgpuComputePipelineRelease(ctx->vec_add_inplace_pipeline);
+    if (ctx->vec_mul_inplace_pipeline) wgpuComputePipelineRelease(ctx->vec_mul_inplace_pipeline);
+    if (ctx->rmsnorm_bf16_inplace_v2_pipeline) wgpuComputePipelineRelease(ctx->rmsnorm_bf16_inplace_v2_pipeline);
+
     /* Release layouts */
     if (ctx->matvec_layout) wgpuBindGroupLayoutRelease(ctx->matvec_layout);
     if (ctx->rmsnorm_layout) wgpuBindGroupLayoutRelease(ctx->rmsnorm_layout);
     if (ctx->gelu_layout) wgpuBindGroupLayoutRelease(ctx->gelu_layout);
+    if (ctx->gelu_mul_layout) wgpuBindGroupLayoutRelease(ctx->gelu_mul_layout);
     if (ctx->softmax_layout) wgpuBindGroupLayoutRelease(ctx->softmax_layout);
     if (ctx->rope_layout) wgpuBindGroupLayoutRelease(ctx->rope_layout);
     if (ctx->gqa_layout) wgpuBindGroupLayoutRelease(ctx->gqa_layout);
     if (ctx->vec_op_layout) wgpuBindGroupLayoutRelease(ctx->vec_op_layout);
     if (ctx->embed_layout) wgpuBindGroupLayoutRelease(ctx->embed_layout);
+
+    /* Release Phase 2 layouts */
+    if (ctx->kv_cache_write_layout) wgpuBindGroupLayoutRelease(ctx->kv_cache_write_layout);
+    if (ctx->multi_head_rmsnorm_layout) wgpuBindGroupLayoutRelease(ctx->multi_head_rmsnorm_layout);
+    if (ctx->rope_precomputed_layout) wgpuBindGroupLayoutRelease(ctx->rope_precomputed_layout);
+    if (ctx->mask_layout) wgpuBindGroupLayoutRelease(ctx->mask_layout);
+
+    /* Release Phase 3 non-aliasing layouts */
+    if (ctx->inplace_vec_op_layout) wgpuBindGroupLayoutRelease(ctx->inplace_vec_op_layout);
+    if (ctx->rmsnorm_inplace_v2_layout) wgpuBindGroupLayoutRelease(ctx->rmsnorm_inplace_v2_layout);
 
     /* Release shader module */
     if (ctx->shader_module) wgpuShaderModuleRelease(ctx->shader_module);
@@ -644,7 +955,705 @@ void gemma3_gpu_submit(gemma3_gpu_context *ctx) {
 }
 
 /* ============================================================================
- * Compute Kernels
+ * Command Encoder Management (Phase 1)
+ * ========================================================================== */
+
+void gemma3_gpu_begin_commands(gemma3_gpu_context *ctx) {
+    if (ctx->encoder_open) return;  /* idempotent */
+
+    WGPUCommandEncoderDescriptor enc_desc = {0};
+    ctx->active_encoder = wgpuDeviceCreateCommandEncoder(ctx->device, &enc_desc);
+    ctx->encoder_open = 1;
+    ctx->pass_open = 0;
+}
+
+void gemma3_gpu_ensure_pass(gemma3_gpu_context *ctx) {
+    if (!ctx->encoder_open) {
+        gemma3_gpu_begin_commands(ctx);
+    }
+    if (!ctx->pass_open) {
+        WGPUComputePassDescriptor pass_desc = {0};
+        ctx->active_pass = wgpuCommandEncoderBeginComputePass(ctx->active_encoder, &pass_desc);
+        ctx->pass_open = 1;
+    }
+}
+
+void gemma3_gpu_flush_commands(gemma3_gpu_context *ctx) {
+    if (!ctx->encoder_open) return;
+
+    /* End compute pass if open */
+    if (ctx->pass_open) {
+        wgpuComputePassEncoderEnd(ctx->active_pass);
+        wgpuComputePassEncoderRelease(ctx->active_pass);
+        ctx->active_pass = NULL;
+        ctx->pass_open = 0;
+    }
+
+    /* Finish encoder and submit */
+    WGPUCommandBufferDescriptor cmd_desc = {0};
+    WGPUCommandBuffer commands = wgpuCommandEncoderFinish(ctx->active_encoder, &cmd_desc);
+    wgpuQueueSubmit(ctx->queue, 1, &commands);
+
+    wgpuCommandBufferRelease(commands);
+    wgpuCommandEncoderRelease(ctx->active_encoder);
+    ctx->active_encoder = NULL;
+    ctx->encoder_open = 0;
+
+    /* Reset params ring for next batch */
+    ctx->params_ring_offset = 0;
+}
+
+/* ============================================================================
+ * Params Ring Buffer (Phase 1)
+ * ========================================================================== */
+
+uint32_t gemma3_gpu_alloc_params(gemma3_gpu_context *ctx, const void *data, uint32_t size) {
+    /* Align offset to 256 bytes (WebGPU minUniformBufferOffsetAlignment) */
+    uint32_t aligned_offset = ctx->params_ring_offset;
+    uint32_t aligned_size = (size + 255u) & ~255u;
+
+    /* Check if we have room */
+    if (aligned_offset + aligned_size > ctx->params_ring_size) {
+        /* Ring buffer full -- reset (safe because we flush before reuse) */
+        aligned_offset = 0;
+        ctx->params_ring_offset = 0;
+    }
+
+    /* Write data at offset */
+    wgpuQueueWriteBuffer(ctx->queue, ctx->buf_params_ring.buffer,
+                          aligned_offset, data, size);
+
+    ctx->params_ring_offset = aligned_offset + aligned_size;
+    return aligned_offset;
+}
+
+/* ============================================================================
+ * Batched Kernel Dispatch Functions (Phase 1)
+ *
+ * Each function records a dispatch into the active compute pass.
+ * The caller must call gemma3_gpu_ensure_pass() before these, and
+ * gemma3_gpu_flush_commands() after the batch is complete.
+ * ========================================================================== */
+
+void gemma3_matvec_bf16_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *y,
+    gemma3_gpu_buffer *A_buf,
+    size_t A_size,
+    gemma3_gpu_buffer *x,
+    int M, int K
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    /* Allocate params from ring buffer */
+    gemma3_matvec_params params = {0};
+    params.M = (uint32_t)M;
+    params.K = (uint32_t)K;
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    /* Create bind group with offset into params ring */
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = A_buf->buffer, .size = A_size},
+        {.binding = 2, .buffer = x->buffer, .size = (size_t)K * sizeof(float)},
+        {.binding = 3, .buffer = y->buffer, .size = (size_t)M * sizeof(float)},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->matvec_layout;
+    bg_desc.entryCount = 4;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    /* Record dispatch into active pass */
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->matvec_bf16_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+
+    /* Tiled kernel: one workgroup per output row, 256 threads reduce the K dimension */
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, (uint32_t)M, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_rmsnorm_bf16_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *y,
+    gemma3_gpu_buffer *x,
+    gemma3_gpu_buffer *weight_buf,
+    size_t weight_size,
+    int n, float eps
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    gemma3_rmsnorm_params params = {0};
+    params.n = (uint32_t)n;
+    params.eps = eps;
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = x->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 2, .buffer = weight_buf->buffer, .size = weight_size},
+        {.binding = 3, .buffer = y->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 4, .buffer = ctx->buf_rmsnorm_scratch.buffer, .size = 256 * sizeof(float)},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->rmsnorm_layout;
+    bg_desc.entryCount = 5;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->rmsnorm_bf16_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, 1, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_rmsnorm_bf16_inplace_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *y,
+    gemma3_gpu_buffer *weight_buf,
+    size_t weight_size,
+    int n, float eps
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    gemma3_rmsnorm_params params = {0};
+    params.n = (uint32_t)n;
+    params.eps = eps;
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    /* In-place: x binding is unused but layout requires it. Bind y for both x and y slots. */
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = y->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 2, .buffer = weight_buf->buffer, .size = weight_size},
+        {.binding = 3, .buffer = y->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 4, .buffer = ctx->buf_rmsnorm_scratch.buffer, .size = 256 * sizeof(float)},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->rmsnorm_layout;
+    bg_desc.entryCount = 5;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->rmsnorm_bf16_inplace_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, 1, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_gelu_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *x,
+    int n
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n, {0} };
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = x->buffer, .size = (size_t)n * sizeof(float)},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->gelu_layout;
+    bg_desc.entryCount = 2;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->gelu_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+
+    uint32_t workgroups = ((uint32_t)n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, workgroups, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_gelu_mul_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *gate,
+    gemma3_gpu_buffer *up,
+    int n
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n, {0} };
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = gate->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 2, .buffer = up->buffer, .size = (size_t)n * sizeof(float)},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->gelu_mul_layout;
+    bg_desc.entryCount = 3;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->gelu_mul_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+
+    uint32_t workgroups = ((uint32_t)n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, workgroups, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_vec_add_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *y,
+    gemma3_gpu_buffer *a,
+    gemma3_gpu_buffer *b,
+    int n
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n, {0} };
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = a->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 2, .buffer = b->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 3, .buffer = y->buffer, .size = (size_t)n * sizeof(float)},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->vec_op_layout;
+    bg_desc.entryCount = 4;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->vec_add_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+
+    uint32_t workgroups = ((uint32_t)n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, workgroups, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_vec_mul_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *y,
+    gemma3_gpu_buffer *a,
+    gemma3_gpu_buffer *b,
+    int n
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n, {0} };
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = a->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 2, .buffer = b->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 3, .buffer = y->buffer, .size = (size_t)n * sizeof(float)},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->vec_op_layout;
+    bg_desc.entryCount = 4;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->vec_mul_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+
+    uint32_t workgroups = ((uint32_t)n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, workgroups, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_rope_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *x,
+    int num_heads,
+    int head_dim,
+    int pos,
+    float theta
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    gemma3_rope_params params = {0};
+    params.head_dim = (uint32_t)head_dim;
+    params.pos = (uint32_t)pos;
+    params.theta = theta;
+    params.num_heads = (uint32_t)num_heads;
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = x->buffer, .size = (size_t)num_heads * head_dim * sizeof(float)},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->rope_layout;
+    bg_desc.entryCount = 2;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    int total_pairs = num_heads * (head_dim / 2);
+    uint32_t workgroups = ((uint32_t)total_pairs + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->rope_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, workgroups, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_gqa_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *output,
+    gemma3_gpu_buffer *q,
+    gemma3_gpu_buffer *k_cache,
+    gemma3_gpu_buffer *v_cache,
+    int n_heads, int n_kv_heads,
+    int seq_len, int head_dim,
+    float scale,
+    gemma3_gpu_buffer *mask
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    gemma3_gqa_params params = {0};
+    params.n_heads = (uint32_t)n_heads;
+    params.n_kv_heads = (uint32_t)n_kv_heads;
+    params.seq_len = (uint32_t)seq_len;
+    params.head_dim = (uint32_t)head_dim;
+    params.scale = scale;
+    params.use_mask = mask ? 1 : 0;
+    params.scores_stride = (uint32_t)seq_len;  /* Per-head scores: each head gets seq_len entries */
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBuffer mask_buffer = mask ? mask->buffer : ctx->buf_mask.buffer;
+    size_t mask_size = (size_t)seq_len * sizeof(float);
+    size_t kv_size = (size_t)seq_len * n_kv_heads * head_dim * sizeof(float);
+    size_t scores_size = (size_t)n_heads * seq_len * sizeof(float);
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = q->buffer, .size = (size_t)n_heads * head_dim * sizeof(float)},
+        {.binding = 2, .buffer = k_cache->buffer, .size = kv_size},
+        {.binding = 3, .buffer = v_cache->buffer, .size = kv_size},
+        {.binding = 4, .buffer = mask_buffer, .size = mask_size},
+        {.binding = 5, .buffer = output->buffer, .size = (size_t)n_heads * head_dim * sizeof(float)},
+        {.binding = 6, .buffer = ctx->buf_attn_scores.buffer, .size = scores_size},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->gqa_layout;
+    bg_desc.entryCount = 7;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->gqa_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, (uint32_t)n_heads, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+/* ============================================================================
+ * Phase 2: RoPE Table Upload
+ * ========================================================================== */
+
+void gemma3_gpu_upload_rope_tables(gemma3_gpu_context *ctx,
+                                    const float *rope_local,
+                                    const float *rope_global) {
+    size_t table_size = (size_t)ctx->max_context * (ctx->head_dim / 2) * 2 * sizeof(float);
+    wgpuQueueWriteBuffer(ctx->queue, ctx->buf_rope_local.buffer, 0, rope_local, table_size);
+    wgpuQueueWriteBuffer(ctx->queue, ctx->buf_rope_global.buffer, 0, rope_global, table_size);
+}
+
+/* ============================================================================
+ * Phase 2: Batched Dispatch Functions
+ * ========================================================================== */
+
+void gemma3_kv_cache_write_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *k_in,
+    gemma3_gpu_buffer *v_in,
+    gemma3_gpu_buffer *k_cache,
+    gemma3_gpu_buffer *v_cache,
+    int num_kv_heads, int head_dim,
+    int cache_pos
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    gemma3_kv_cache_write_params params = {0};
+    params.num_kv_heads = (uint32_t)num_kv_heads;
+    params.head_dim = (uint32_t)head_dim;
+    params.cache_pos = (uint32_t)cache_pos;
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    int kv_size = num_kv_heads * head_dim;
+    size_t kv_bytes = (size_t)kv_size * sizeof(float);
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = k_in->buffer, .size = kv_bytes},
+        {.binding = 2, .buffer = v_in->buffer, .size = kv_bytes},
+        {.binding = 3, .buffer = k_cache->buffer, .size = k_cache->size},
+        {.binding = 4, .buffer = v_cache->buffer, .size = v_cache->size},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->kv_cache_write_layout;
+    bg_desc.entryCount = 5;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    uint32_t workgroups = ((uint32_t)kv_size + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->kv_cache_write_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, workgroups, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_multi_head_rmsnorm_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *x,
+    gemma3_gpu_buffer *weight_buf,
+    size_t weight_size,
+    int head_dim, int num_heads,
+    float eps
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    gemma3_multi_head_rmsnorm_params params = {0};
+    params.head_dim = (uint32_t)head_dim;
+    params.num_heads = (uint32_t)num_heads;
+    params.eps = eps;
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = x->buffer, .size = (size_t)num_heads * head_dim * sizeof(float)},
+        {.binding = 2, .buffer = weight_buf->buffer, .size = weight_size},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->multi_head_rmsnorm_layout;
+    bg_desc.entryCount = 3;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    /* One workgroup per head */
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->multi_head_rmsnorm_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, (uint32_t)num_heads, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_rope_precomputed_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *x,
+    gemma3_gpu_buffer *rope_table,
+    int num_heads, int head_dim,
+    int pos
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    gemma3_rope_precomputed_params params = {0};
+    params.head_dim = (uint32_t)head_dim;
+    params.num_heads = (uint32_t)num_heads;
+    params.pos = (uint32_t)pos;
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = x->buffer, .size = (size_t)num_heads * head_dim * sizeof(float)},
+        {.binding = 2, .buffer = rope_table->buffer, .size = rope_table->size},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->rope_precomputed_layout;
+    bg_desc.entryCount = 3;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    int total_pairs = num_heads * (head_dim / 2);
+    uint32_t workgroups = ((uint32_t)total_pairs + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->rope_precomputed_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, workgroups, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_mask_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *mask_out,
+    int query_pos, int seq_len,
+    int window_size, int is_causal
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    gemma3_mask_params params = {0};
+    params.query_pos = (uint32_t)query_pos;
+    params.window_size = (uint32_t)window_size;
+    params.is_causal = (uint32_t)is_causal;
+    params.seq_len = (uint32_t)seq_len;
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = mask_out->buffer, .size = (size_t)seq_len * sizeof(float)},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->mask_layout;
+    bg_desc.entryCount = 2;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    uint32_t workgroups = ((uint32_t)seq_len + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+
+    WGPUComputePipeline pipeline = is_causal ? ctx->causal_mask_pipeline : ctx->sliding_window_mask_pipeline;
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, workgroups, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+/* ============================================================================
+ * Phase 3 Non-Aliasing In-Place Dispatch Functions
+ * ========================================================================== */
+
+void gemma3_vec_add_inplace_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *y,
+    gemma3_gpu_buffer *b,
+    int n
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n, {0} };
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = y->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 2, .buffer = b->buffer, .size = (size_t)n * sizeof(float)},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->inplace_vec_op_layout;
+    bg_desc.entryCount = 3;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    uint32_t workgroups = ((uint32_t)n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->vec_add_inplace_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, workgroups, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_vec_mul_inplace_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *y,
+    gemma3_gpu_buffer *b,
+    int n
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n, {0} };
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = y->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 2, .buffer = b->buffer, .size = (size_t)n * sizeof(float)},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->inplace_vec_op_layout;
+    bg_desc.entryCount = 3;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    uint32_t workgroups = ((uint32_t)n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->vec_mul_inplace_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, workgroups, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+void gemma3_rmsnorm_bf16_inplace_v2_dispatch_gpu(
+    gemma3_gpu_context *ctx,
+    gemma3_gpu_buffer *data,
+    gemma3_gpu_buffer *weight_buf,
+    size_t weight_size,
+    int n, float eps
+) {
+    gemma3_gpu_ensure_pass(ctx);
+
+    gemma3_rmsnorm_params params = {0};
+    params.n = (uint32_t)n;
+    params.eps = eps;
+    uint32_t param_offset = gemma3_gpu_alloc_params(ctx, &params, sizeof(params));
+
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .offset = param_offset, .size = sizeof(params)},
+        {.binding = 1, .buffer = data->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 2, .buffer = weight_buf->buffer, .size = weight_size},
+        {.binding = 3, .buffer = ctx->buf_rmsnorm_scratch.buffer,
+         .size = ctx->buf_rmsnorm_scratch.size},
+    };
+
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->rmsnorm_inplace_v2_layout;
+    bg_desc.entryCount = 4;
+    bg_desc.entries = entries;
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+
+    wgpuComputePassEncoderSetPipeline(ctx->active_pass, ctx->rmsnorm_bf16_inplace_v2_pipeline);
+    wgpuComputePassEncoderSetBindGroup(ctx->active_pass, 0, bind_group, 0, NULL);
+    wgpuComputePassEncoderDispatchWorkgroups(ctx->active_pass, 1, 1, 1);
+
+    wgpuBindGroupRelease(bind_group);
+}
+
+/* ============================================================================
+ * Legacy Compute Kernels (original per-operation encoder pattern)
  * ========================================================================== */
 
 void gemma3_matvec_bf16_gpu(
@@ -690,8 +1699,8 @@ void gemma3_matvec_bf16_gpu(
     wgpuComputePassEncoderSetPipeline(pass, ctx->matvec_bf16_pipeline);
     wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
 
-    uint32_t workgroups = ((uint32_t)M + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
-    wgpuComputePassEncoderDispatchWorkgroups(pass, workgroups, 1, 1);
+    /* Tiled kernel: one workgroup per output row */
+    wgpuComputePassEncoderDispatchWorkgroups(pass, (uint32_t)M, 1, 1);
 
     wgpuComputePassEncoderEnd(pass);
 
@@ -928,11 +1937,13 @@ void gemma3_gqa_gpu(
     params.head_dim = (uint32_t)head_dim;
     params.scale = scale;
     params.use_mask = mask ? 1 : 0;
+    params.scores_stride = (uint32_t)seq_len;  /* Per-head scores */
     gemma3_gpu_write_buffer(ctx, &ctx->buf_params, &params, sizeof(params));
 
     WGPUBuffer mask_buffer = mask ? mask->buffer : ctx->buf_mask.buffer;
     size_t mask_size = (size_t)seq_len * sizeof(float);
     size_t kv_size = (size_t)seq_len * n_kv_heads * head_dim * sizeof(float);
+    size_t scores_size = (size_t)n_heads * seq_len * sizeof(float);
 
     WGPUBindGroupEntry entries[] = {
         {.binding = 0, .buffer = ctx->buf_params.buffer, .size = sizeof(params)},
@@ -941,7 +1952,7 @@ void gemma3_gqa_gpu(
         {.binding = 3, .buffer = v_cache->buffer, .size = kv_size},
         {.binding = 4, .buffer = mask_buffer, .size = mask_size},
         {.binding = 5, .buffer = output->buffer, .size = (size_t)n_heads * head_dim * sizeof(float)},
-        {.binding = 6, .buffer = ctx->buf_attn_scores.buffer, .size = (size_t)seq_len * sizeof(float)},
+        {.binding = 6, .buffer = ctx->buf_attn_scores.buffer, .size = scores_size},
     };
 
     WGPUBindGroupDescriptor bg_desc = {0};
@@ -1080,8 +2091,9 @@ void gemma3_embed_bf16_gpu(
     const uint16_t *row = embed + token_id * hidden_size;
     gemma3_gpu_write_buffer(ctx, &embed_buf, row, row_size);
 
-    struct { uint32_t token_id; uint32_t hidden_size; uint32_t _pad[2]; } params = {
-        0, (uint32_t)hidden_size, {0}
+    float embed_scale = sqrtf((float)hidden_size);
+    struct { uint32_t token_id; uint32_t hidden_size; float embed_scale; uint32_t _pad; } params = {
+        0, (uint32_t)hidden_size, embed_scale, 0
     };
     gemma3_gpu_write_buffer(ctx, &ctx->buf_params, &params, sizeof(params));
 

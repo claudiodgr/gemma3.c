@@ -480,4 +480,5 @@ FodyWeavers.xsd
 
 build_msvc/
 *.7z
+build_output.txt
 !shaders/*.inc

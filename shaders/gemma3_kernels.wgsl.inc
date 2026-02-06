@@ -74,48 +74,55 @@ fn matvec_bf16_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
     matvec_y[row] = sum;\n\
 }\n\
 \n\
-// Optimized version with workgroup-level reduction for better memory coalescing\n\
+// Optimized version: one workgroup per row, 256 threads split the K dimension,\n\
+// tree-reduce partial sums in shared memory.\n\
+// Dispatch as (M, 1, 1) workgroups.\n\
+var<workgroup> mv_reduce: array<f32, 256>;\n\
+\n\
 @compute @workgroup_size(256)\n\
 fn matvec_bf16_kernel_tiled(\n\
-    @builtin(global_invocation_id) gid: vec3<u32>,\n\
     @builtin(local_invocation_id) lid: vec3<u32>,\n\
     @builtin(workgroup_id) wgid: vec3<u32>\n\
 ) {\n\
-    // Each workgroup computes one row\n\
     let row = wgid.x;\n\
     if (row >= matvec_params.M) {\n\
         return;\n\
     }\n\
 \n\
     let K = matvec_params.K;\n\
-    let local_id = lid.x;\n\
-    let local_size = 256u;\n\
-\n\
-    // Each thread processes a chunk of the row\n\
-    var sum: f32 = 0.0;\n\
+    let tid = lid.x;\n\
     let row_offset = row * K;\n\
+    var acc: f32 = 0.0;\n\
 \n\
-    var k = local_id * 2u;\n\
-    for (; k < K; k = k + local_size * 2u) {\n\
-        if (k + 1u < K) {\n\
-            let packed = matvec_A[(row_offset + k) / 2u];\n\
-            let a0 = bf16_to_f32(packed & 0xffffu);\n\
-            let a1 = bf16_to_f32(packed >> 16u);\n\
-            sum = sum + a0 * matvec_x[k] + a1 * matvec_x[k + 1u];\n\
-        } else if (k < K) {\n\
-            let packed = matvec_A[(row_offset + k) / 2u];\n\
-            let a0 = bf16_to_f32(packed & 0xffffu);\n\
-            sum = sum + a0 * matvec_x[k];\n\
-        }\n\
+    // Each thread strides through K, processing 2 BF16 values (1 packed u32) per step.\n\
+    // 256 threads × 2 elements = stride of 512 per iteration.\n\
+    var k = tid * 2u;\n\
+    for (; k + 1u < K; k = k + 512u) {\n\
+        let packed = matvec_A[(row_offset + k) / 2u];\n\
+        let a0 = bf16_to_f32(packed & 0xffffu);\n\
+        let a1 = bf16_to_f32(packed >> 16u);\n\
+        acc = acc + a0 * matvec_x[k] + a1 * matvec_x[k + 1u];\n\
+    }\n\
+    // Handle odd K (last element if K is not a multiple of 2)\n\
+    if (k < K) {\n\
+        let packed = matvec_A[(row_offset + k) / 2u];\n\
+        let a0 = bf16_to_f32(packed & 0xffffu);\n\
+        acc = acc + a0 * matvec_x[k];\n\
     }\n\
 \n\
-    // Workgroup reduction (using subgroups if available, otherwise shared memory)\n\
-    // For simplicity, use atomicAdd\n\
-    // Note: WGSL doesn't have atomicAdd for f32, so we use a different approach\n\
+    // Tree reduction in shared memory\n\
+    mv_reduce[tid] = acc;\n\
+    workgroupBarrier();\n\
 \n\
-    // Store partial sum (simplified - in production use proper reduction)\n\
-    if (local_id == 0u) {\n\
-        matvec_y[row] = sum;\n\
+    for (var s = 128u; s > 0u; s = s >> 1u) {\n\
+        if (tid < s) {\n\
+            mv_reduce[tid] = mv_reduce[tid] + mv_reduce[tid + s];\n\
+        }\n\
+        workgroupBarrier();\n\
+    }\n\
+\n\
+    if (tid == 0u) {\n\
+        matvec_y[row] = mv_reduce[0];\n\
     }\n\
 }\n\
 \n\
@@ -296,6 +303,29 @@ fn silu_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
 }\n\
 \n\
 // ============================================================================\n\
+// Fused GELU + Multiply (SwiGLU gate activation)\n\
+// gate[i] = gelu(gate[i]) * up[i]\n\
+// Eliminates one global memory round-trip per layer.\n\
+// ============================================================================\n\
+\n\
+@group(0) @binding(0) var<uniform> gelu_mul_params: GeluParams;  // Reuse struct (just needs n)\n\
+@group(0) @binding(1) var<storage, read_write> gelu_mul_gate: array<f32>;\n\
+@group(0) @binding(2) var<storage, read> gelu_mul_up: array<f32>;\n\
+\n\
+@compute @workgroup_size(256)\n\
+fn gelu_mul_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if (i >= gelu_mul_params.n) {\n\
+        return;\n\
+    }\n\
+\n\
+    let x = gelu_mul_gate[i];\n\
+    let x3 = x * x * x;\n\
+    let inner = SQRT_2_OVER_PI * (x + GELU_COEFF * x3);\n\
+    gelu_mul_gate[i] = 0.5 * x * (1.0 + tanh(inner)) * gelu_mul_up[i];\n\
+}\n\
+\n\
+// ============================================================================\n\
 // Softmax (numerically stable)\n\
 // softmax(x)[i] = exp(x[i] - max(x)) / sum(exp(x - max(x)))\n\
 // ============================================================================\n\
@@ -377,8 +407,8 @@ fn softmax_kernel(\n\
 // ============================================================================\n\
 // RoPE (Rotary Position Embeddings)\n\
 // For each dimension pair (i, i + d/2):\n\
-// [x_i, x_{i+d/2}] = [cos(Î¸)*x_i - sin(Î¸)*x_{i+d/2}, sin(Î¸)*x_i + cos(Î¸)*x_{i+d/2}]\n\
-// where Î¸ = pos * freq, freq = 1 / (theta^(2i/d))\n\
+// [x_i, x_{i+d/2}] = [cos(θ)*x_i - sin(θ)*x_{i+d/2}, sin(θ)*x_i + cos(θ)*x_{i+d/2}]\n\
+// where θ = pos * freq, freq = 1 / (theta^(2i/d))\n\
 // ============================================================================\n\
 \n\
 struct RopeParams {\n\
@@ -396,8 +426,8 @@ fn rope_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
     let half_dim = rope_params.head_dim / 2u;\n\
     let total_pairs = rope_params.num_heads * half_dim;\n\
 \n\
-    let pair_idx = gid.x;\n\
-    if (pair_idx >= total_pairs) {\n\
+    let pair_idx = gid.x;\n"
+"    if (pair_idx >= total_pairs) {\n\
         return;\n\
     }\n\
 \n\
@@ -428,14 +458,14 @@ fn rope_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
 // With head grouping: each KV head serves multiple Q heads\n\
 // ============================================================================\n\
 \n\
-struct GqaParams {\n"
-"    n_heads: u32,\n\
+struct GqaParams {\n\
+    n_heads: u32,\n\
     n_kv_heads: u32,\n\
     seq_len: u32,\n\
     head_dim: u32,\n\
     scale: f32,\n\
     use_mask: u32,\n\
-    _pad0: u32,\n\
+    scores_stride: u32,  // Per-head stride into gqa_scores (0 = shared, seq_len = per-head)\n\
     _pad1: u32,\n\
 }\n\
 \n\
@@ -445,8 +475,11 @@ struct GqaParams {\n"
 @group(0) @binding(3) var<storage, read> gqa_v: array<f32>;       // [seq_len, n_kv_heads, head_dim]\n\
 @group(0) @binding(4) var<storage, read> gqa_mask: array<f32>;    // [seq_len]\n\
 @group(0) @binding(5) var<storage, read_write> gqa_output: array<f32>; // [n_heads, head_dim]\n\
-@group(0) @binding(6) var<storage, read_write> gqa_scores: array<f32>; // Scratch [seq_len]\n\
+@group(0) @binding(6) var<storage, read_write> gqa_scores: array<f32>; // Scratch [n_heads * scores_stride]\n\
 \n\
+// Shared memory: first 256 for Q vector cache, second 256 for reductions/score tiles.\n\
+// Total: 2048 bytes (well under 16KB limit).\n\
+var<workgroup> gqa_shared_q: array<f32, 256>;\n\
 var<workgroup> gqa_shared: array<f32, 256>;\n\
 \n\
 // Each workgroup processes one head\n\
@@ -472,61 +505,65 @@ fn gqa_kernel(\n\
     let kv_head = head / heads_per_group;\n\
     let kv_stride = n_kv_heads * head_dim;\n\
 \n\
-    // Pointers\n\
+    // Per-head score offset\n\
+    let scores_base = head * gqa_params.scores_stride;\n\
     let q_offset = head * head_dim;\n\
 \n\
-    // Phase 1: Compute attention scores\n\
-    // scores[i] = (Q Â· K[i]) * scale + mask[i]\n\
+    // Load Q vector into shared memory (256 floats = 1KB, one load per thread)\n\
+    if (local_id < head_dim) {\n\
+        gqa_shared_q[local_id] = gqa_q[q_offset + local_id];\n\
+    }\n\
+    workgroupBarrier();\n\
+\n\
+    // Phase 1: Compute attention scores using shared Q\n\
+    // scores[i] = (Q · K[i]) * scale + mask[i]\n\
     var i = local_id;\n\
     for (; i < seq_len; i = i + local_size) {\n\
         var score: f32 = 0.0;\n\
         let k_offset = i * kv_stride + kv_head * head_dim;\n\
         for (var d: u32 = 0u; d < head_dim; d = d + 1u) {\n\
-            score = score + gqa_q[q_offset + d] * gqa_k[k_offset + d];\n\
+            score = score + gqa_shared_q[d] * gqa_k[k_offset + d];\n\
         }\n\
         score = score * scale;\n\
         if (gqa_params.use_mask != 0u) {\n\
             score = score + gqa_mask[i];\n\
         }\n\
-        gqa_scores[i] = score;\n\
+        gqa_scores[scores_base + i] = score;\n\
     }\n\
     workgroupBarrier();\n\
 \n\
-    // Phase 2: Softmax over scores\n\
-    // Find max\n\
+    // Phase 2: Softmax - find max\n\
     var max_val: f32 = -3.402823466e+38;\n\
     i = local_id;\n\
     for (; i < seq_len; i = i + local_size) {\n\
-        max_val = max(max_val, gqa_scores[i]);\n\
+        max_val = max(max_val, gqa_scores[scores_base + i]);\n\
     }\n\
     gqa_shared[local_id] = max_val;\n\
     workgroupBarrier();\n\
 \n\
-    var stride = min(local_size, seq_len) / 2u;\n\
-    for (; stride > 0u; stride = stride / 2u) {\n\
-        if (local_id < stride) {\n\
-            gqa_shared[local_id] = max(gqa_shared[local_id], gqa_shared[local_id + stride]);\n\
+    for (var s = 128u; s > 0u; s = s >> 1u) {\n\
+        if (local_id < s) {\n\
+            gqa_shared[local_id] = max(gqa_shared[local_id], gqa_shared[local_id + s]);\n\
         }\n\
         workgroupBarrier();\n\
     }\n\
     let global_max = gqa_shared[0];\n\
     workgroupBarrier();\n\
 \n\
-    // Compute exp and sum\n\
+    // Softmax - compute exp and sum\n\
     var sum: f32 = 0.0;\n\
     i = local_id;\n\
     for (; i < seq_len; i = i + local_size) {\n\
-        let exp_val = exp(gqa_scores[i] - global_max);\n\
-        gqa_scores[i] = exp_val;\n\
+        let exp_val = exp(gqa_scores[scores_base + i] - global_max);\n\
+        gqa_scores[scores_base + i] = exp_val;\n\
         sum = sum + exp_val;\n\
     }\n\
     gqa_shared[local_id] = sum;\n\
     workgroupBarrier();\n\
 \n\
-    stride = min(local_size, seq_len) / 2u;\n\
-    for (; stride > 0u; stride = stride / 2u) {\n\
-        if (local_id < stride) {\n\
-            gqa_shared[local_id] = gqa_shared[local_id] + gqa_shared[local_id + stride];\n\
+    for (var s = 128u; s > 0u; s = s >> 1u) {\n\
+        if (local_id < s) {\n\
+            gqa_shared[local_id] = gqa_shared[local_id] + gqa_shared[local_id + s];\n\
         }\n\
         workgroupBarrier();\n\
     }\n\
@@ -536,19 +573,37 @@ fn gqa_kernel(\n\
     // Normalize scores\n\
     i = local_id;\n\
     for (; i < seq_len; i = i + local_size) {\n\
-        gqa_scores[i] = gqa_scores[i] * inv_sum;\n\
+        gqa_scores[scores_base + i] = gqa_scores[scores_base + i] * inv_sum;\n\
     }\n\
     workgroupBarrier();\n\
 \n\
-    // Phase 3: Weighted sum of values\n\
+    // Phase 3: Weighted sum of values with tiled score caching\n\
     // output[d] = sum_i(scores[i] * V[i, d])\n\
     var d = local_id;\n\
     for (; d < head_dim; d = d + local_size) {\n\
         var weighted_sum: f32 = 0.0;\n\
-        for (var j: u32 = 0u; j < seq_len; j = j + 1u) {\n\
-            let v_offset = j * kv_stride + kv_head * head_dim + d;\n\
-            weighted_sum = weighted_sum + gqa_scores[j] * gqa_v[v_offset];\n\
+\n\
+        // Process scores in tiles of 256 to amortize global memory reads\n\
+        var tile_start: u32 = 0u;\n\
+        for (; tile_start < seq_len; tile_start = tile_start + 256u) {\n\
+            // Cooperatively load scores tile into shared memory\n\
+            let tile_idx = tile_start + local_id;\n\
+            if (tile_idx < seq_len) {\n\
+                gqa_shared[local_id] = gqa_scores[scores_base + tile_idx];\n\
+            } else {\n\
+                gqa_shared[local_id] = 0.0;\n\
+            }\n\
+            workgroupBarrier();\n\
+\n\
+            // Accumulate weighted values from this tile\n\
+            let tile_end = min(tile_start + 256u, seq_len);\n\
+            for (var j = tile_start; j < tile_end; j = j + 1u) {\n\
+                let v_offset = j * kv_stride + kv_head * head_dim + d;\n\
+                weighted_sum = weighted_sum + gqa_shared[j - tile_start] * gqa_v[v_offset];\n\
+            }\n\
+            workgroupBarrier();\n\
         }\n\
+\n\
         gqa_output[q_offset + d] = weighted_sum;\n\
     }\n\
 }\n\
@@ -607,8 +662,8 @@ fn vec_scale_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
 struct EmbedParams {\n\
     token_id: u32,\n\
     hidden_size: u32,\n\
+    embed_scale: f32,  // precomputed sqrt(hidden_size)\n\
     _pad0: u32,\n\
-    _pad1: u32,\n\
 }\n\
 \n\
 @group(0) @binding(0) var<uniform> embed_params: EmbedParams;\n\
@@ -633,9 +688,163 @@ fn embed_bf16_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
         value = bf16_to_f32(packed >> 16u);\n\
     }\n\
 \n\
-    // Scale by sqrt(hidden_size)\n\
-    let scale = sqrt(f32(embed_params.hidden_size));\n\
-    embed_output[i] = value * scale;\n\
+    // Scale by precomputed sqrt(hidden_size)\n\
+    embed_output[i] = value * embed_params.embed_scale;\n\
+}\n\
+\n\
+// ============================================================================\n\
+// KV Cache Write (Phase 2)\n\
+// Writes K/V vectors to the correct position in the GPU-resident KV cache\n\
+// ============================================================================\n\
+\n\
+struct KvCacheWriteParams {\n\
+    num_kv_heads: u32,\n\
+    head_dim: u32,\n\
+    cache_pos: u32,     // Position in cache to write to (ring-buffered for local layers)\n\
+    _pad0: u32,\n\
+}\n\
+\n\
+@group(0) @binding(0) var<uniform> kv_write_params: KvCacheWriteParams;\n\
+@group(0) @binding(1) var<storage, read> kv_k_in: array<f32>;          // [num_kv_heads * head_dim]\n\
+@group(0) @binding(2) var<storage, read> kv_v_in: array<f32>;          // [num_kv_heads * head_dim]\n\
+@group(0) @binding(3) var<storage, read_write> kv_k_cache: array<f32>; // [max_seq * num_kv_heads * head_dim]\n\
+@group(0) @binding(4) var<storage, read_write> kv_v_cache: array<f32>; // [max_seq * num_kv_heads * head_dim]\n\
+\n\
+@compute @workgroup_size(256)\n\
+fn kv_cache_write_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    let kv_size = kv_write_params.num_kv_heads * kv_write_params.head_dim;\n\
+    if (i >= kv_size) {\n\
+        return;\n\
+    }\n\
+\n\
+    let cache_offset = kv_write_params.cache_pos * kv_size + i;\n\
+    kv_k_cache[cache_offset] = kv_k_in[i];\n\
+    kv_v_cache[cache_offset] = kv_v_in[i];\n\
+}\n\
+\n\
+// ============================================================================\n\
+// Multi-Head RMSNorm (Phase 2)\n\
+// Per-head RMSNorm for QK normalization: each workgroup processes one head\n\
+// y[head*d+i] = x[head*d+i] * rsqrt(mean(x[head*d:head*d+d]^2) + eps) * (1 + weight[i])\n\
+// ============================================================================\n\
+\n\
+struct MultiHeadRmsnormParams {\n\
+    head_dim: u32,\n\
+    num_heads: u32,\n\
+    eps: f32,\n\
+    _pad0: u32,\n\
+}\n\
+\n\
+@group(0) @binding(0) var<uniform> mh_rmsnorm_params: MultiHeadRmsnormParams;\n\
+@group(0) @binding(1) var<storage, read_write> mh_rmsnorm_x: array<f32>;   // [num_heads * head_dim]\n\
+@group(0) @binding(2) var<storage, read> mh_rmsnorm_weight: array<u32>;     // BF16 packed [head_dim/2 u32]\n\
+\n\
+var<workgroup> mh_rmsnorm_shared: array<f32, 256>;\n\
+\n\
+// Each workgroup handles one head\n\
+@compute @workgroup_size(256)\n\
+fn multi_head_rmsnorm_bf16_kernel(\n\
+    @builtin(workgroup_id) wgid: vec3<u32>,\n\
+    @builtin(local_invocation_id) lid: vec3<u32>\n\
+) {\n\
+    let head = wgid.x;\n\
+    if (head >= mh_rmsnorm_params.num_heads) {\n\
+        return;\n\
+    }\n\
+\n\
+    let head_dim = mh_rmsnorm_params.head_dim;\n\
+    let local_id = lid.x;\n\
+    let local_size = 256u;\n\
+    let head_offset = head * head_dim;\n\
+\n\
+    // Phase 1: Compute partial sum of squares\n\
+    var sum_sq: f32 = 0.0;\n\
+    var i = local_id;\n\
+    for (; i < head_dim; i = i + local_size) {\n\
+        let xi = mh_rmsnorm_x[head_offset + i];\n\
+        sum_sq = sum_sq + xi * xi;\n\
+    }\n\
+\n\
+    mh_rmsnorm_shared[local_id] = sum_sq;\n\
+    workgroupBarrier();\n\
+\n\
+    // Reduction\n\
+    var stride = local_size / 2u;\n\
+    for (; stride > 0u; stride = stride / 2u) {\n\
+        if (local_id < stride) {\n\
+            mh_rmsnorm_shared[local_id] = mh_rmsnorm_shared[local_id] + mh_rmsnorm_shared[local_id + stride];\n\
+        }\n\
+        workgroupBarrier();\n\
+    }\n\
+\n\
+    let mean_sq = mh_rmsnorm_shared[0] / f32(head_dim);\n\
+    let rsqrt_val = inverseSqrt(mean_sq + mh_rmsnorm_params.eps);\n\
+\n\
+    workgroupBarrier();\n\
+\n\
+    // Phase 2: Apply normalization with (1 + weight)\n\
+    i = local_id;\n\
+    for (; i < head_dim; i = i + local_size) {\n\
+        let xi = mh_rmsnorm_x[head_offset + i];\n\
+        let packed_idx = i / 2u;\n\
+        let packed = mh_rmsnorm_weight[packed_idx];\n\
+        var w: f32;\n\
+        if (i % 2u == 0u) {\n\
+            w = bf16_to_f32(packed & 0xffffu);\n\
+        } else {\n\
+            w = bf16_to_f32(packed >> 16u);\n\
+        }\n\
+        mh_rmsnorm_x[head_offset + i] = xi * rsqrt_val * (1.0 + w);\n\
+    }\n\
+}\n\
+\n\
+// ============================================================================\n\
+// RoPE with Precomputed cos/sin Table (Phase 2)\n\
+// Uses precomputed table instead of computing trig functions per dispatch\n\
+// Table layout: [max_context, head_dim/2, 2] where [..,0]=cos, [..,1]=sin\n\
+// ============================================================================\n\
+\n\
+struct RopePrecomputedParams {\n\
+    head_dim: u32,\n\
+    num_heads: u32,\n\
+    pos: u32,\n\
+    _pad0: u32,\n\
+}\n\
+\n\
+@group(0) @binding(0) var<uniform> rope_pre_params: RopePrecomputedParams;\n\
+@group(0) @binding(1) var<storage, read_write> rope_pre_x: array<f32>;  // [num_heads * head_dim]\n\
+@group(0) @binding(2) var<storage, read> rope_pre_table: array<f32>;    // [max_context * head_dim/2 * 2]\n\
+\n"
+"@compute @workgroup_size(256)\n\
+fn rope_precomputed_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let half_dim = rope_pre_params.head_dim / 2u;\n\
+    let total_pairs = rope_pre_params.num_heads * half_dim;\n\
+\n\
+    let pair_idx = gid.x;\n\
+    if (pair_idx >= total_pairs) {\n\
+        return;\n\
+    }\n\
+\n\
+    let head = pair_idx / half_dim;\n\
+    let i = pair_idx % half_dim;\n\
+\n\
+    // Lookup precomputed cos/sin\n\
+    // table[(pos * half_dim + i) * 2 + 0] = cos\n\
+    // table[(pos * half_dim + i) * 2 + 1] = sin\n\
+    let table_offset = (rope_pre_params.pos * half_dim + i) * 2u;\n\
+    let cos_val = rope_pre_table[table_offset];\n\
+    let sin_val = rope_pre_table[table_offset + 1u];\n\
+\n\
+    // Get indices\n\
+    let idx0 = head * rope_pre_params.head_dim + i;\n\
+    let idx1 = idx0 + half_dim;\n\
+\n\
+    // Apply rotation\n\
+    let x0 = rope_pre_x[idx0];\n\
+    let x1 = rope_pre_x[idx1];\n\
+    rope_pre_x[idx0] = x0 * cos_val - x1 * sin_val;\n\
+    rope_pre_x[idx1] = x0 * sin_val + x1 * cos_val;\n\
 }\n\
 \n\
 // ============================================================================\n\
@@ -751,5 +960,104 @@ fn argmax_kernel(\n\
 \n\
     if (local_id == 0u) {\n\
         argmax_output[0] = argmax_shared_idx[0];\n\
+    }\n\
+}\n\
+\n\
+// ============================================================================\n\
+// In-Place Vector Operations (Phase 3: non-aliasing bind groups)\n\
+//\n\
+// These kernels avoid the WebGPU validation error where the same buffer\n\
+// is bound as both STORAGE_READ_ONLY and STORAGE_READ_WRITE in one dispatch.\n\
+// Layout: params (uniform), y (storage rw), b (storage read)\n\
+// ============================================================================\n\
+\n\
+struct InplaceVecParams {\n\
+    n: u32,\n\
+    _pad0: u32,\n\
+    _pad1: u32,\n\
+    _pad2: u32,\n\
+}\n\
+\n\
+@group(0) @binding(0) var<uniform> inplace_vec_params: InplaceVecParams;\n\
+@group(0) @binding(1) var<storage, read_write> inplace_vec_y: array<f32>;\n\
+@group(0) @binding(2) var<storage, read> inplace_vec_b: array<f32>;\n\
+\n\
+// In-place addition: y[i] += b[i]\n\
+@compute @workgroup_size(256)\n\
+fn vec_add_inplace_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if (i >= inplace_vec_params.n) { return; }\n\
+    inplace_vec_y[i] = inplace_vec_y[i] + inplace_vec_b[i];\n\
+}\n\
+\n\
+// In-place multiplication: y[i] *= b[i]\n\
+@compute @workgroup_size(256)\n\
+fn vec_mul_inplace_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if (i >= inplace_vec_params.n) { return; }\n\
+    inplace_vec_y[i] = inplace_vec_y[i] * inplace_vec_b[i];\n\
+}\n\
+\n\
+// ============================================================================\n\
+// In-Place RMSNorm (Phase 3: non-aliasing bind groups)\n\
+//\n\
+// data[i] = data[i] * rsqrt(mean(data^2) + eps) * (1.0 + weight[i])\n\
+// Layout: params (uniform), data (storage rw), weight (storage read), scratch (storage rw)\n\
+// ============================================================================\n\
+\n\
+@group(0) @binding(0) var<uniform> rmsnorm_ip_params: RmsnormParams;\n\
+@group(0) @binding(1) var<storage, read_write> rmsnorm_ip_data: array<f32>;\n\
+@group(0) @binding(2) var<storage, read> rmsnorm_ip_weight: array<u32>;\n\
+@group(0) @binding(3) var<storage, read_write> rmsnorm_ip_scratch: array<f32>;\n\
+\n\
+var<workgroup> rmsnorm_ip_shared: array<f32, 256>;\n\
+\n\
+@compute @workgroup_size(256)\n\
+fn rmsnorm_bf16_inplace_v2_kernel(\n\
+    @builtin(global_invocation_id) gid: vec3<u32>,\n\
+    @builtin(local_invocation_id) lid: vec3<u32>\n\
+) {\n\
+    let n = rmsnorm_ip_params.n;\n\
+    let local_id = lid.x;\n\
+    let local_size = 256u;\n\
+\n\
+    // Phase 1: Compute partial sum of squares\n\
+    var sum_sq: f32 = 0.0;\n\
+    var i = local_id;\n\
+    for (; i < n; i = i + local_size) {\n\
+        let xi = rmsnorm_ip_data[i];\n\
+        sum_sq = sum_sq + xi * xi;\n\
+    }\n\
+\n\
+    rmsnorm_ip_shared[local_id] = sum_sq;\n\
+    workgroupBarrier();\n\
+\n\
+    // Reduction\n\
+    var stride = local_size / 2u;\n\
+    for (; stride > 0u; stride = stride / 2u) {\n\
+        if (local_id < stride) {\n\
+            rmsnorm_ip_shared[local_id] = rmsnorm_ip_shared[local_id] + rmsnorm_ip_shared[local_id + stride];\n\
+        }\n\
+        workgroupBarrier();\n\
+    }\n\
+\n\
+    let mean_sq = rmsnorm_ip_shared[0] / f32(n);\n\
+    let rsqrt_val = inverseSqrt(mean_sq + rmsnorm_ip_params.eps);\n\
+\n\
+    workgroupBarrier();\n\
+\n\
+    // Phase 2: Apply in-place\n\
+    i = local_id;\n\
+    for (; i < n; i = i + local_size) {\n\
+        let xi = rmsnorm_ip_data[i];\n\
+        let packed_idx = i / 2u;\n\
+        let packed = rmsnorm_ip_weight[packed_idx];\n\
+        var w: f32;\n\
+        if (i % 2u == 0u) {\n\
+            w = bf16_to_f32(packed & 0xffffu);\n\
+        } else {\n\
+            w = bf16_to_f32(packed >> 16u);\n\
+        }\n\
+        rmsnorm_ip_data[i] = xi * rsqrt_val * (1.0 + w);\n\
     }\n\
 }\n"

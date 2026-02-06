@@ -33,39 +33,13 @@
  */
 static inline void matvec_bf16_dispatch(float *y, const uint16_t *A, const float *x,
                                          int M, int K, float *scratch, void *pool) {
-#ifdef USE_WEBGPU
-    /* WebGPU path: pool is actually a gemma3_gpu_context* */
-    if (pool) {
-        gemma3_gpu_context *gpu = (gemma3_gpu_context *)pool;
-        /* For GPU execution, we use pre-allocated buffers from the context */
-        /* Note: This is a simplified dispatch - full integration would manage
-         * GPU buffers more efficiently without CPU-GPU copies per operation */
-
-        /* Create temporary GPU buffers and execute */
-        gemma3_gpu_buffer y_buf = gemma3_gpu_create_buffer(gpu, M * sizeof(float),
-            WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
-        gemma3_gpu_buffer x_buf = gemma3_gpu_create_buffer(gpu, K * sizeof(float),
-            WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
-
-        gemma3_gpu_write_buffer(gpu, &x_buf, x, K * sizeof(float));
-        gemma3_matvec_bf16_gpu(gpu, &y_buf, A, &x_buf, M, K);
-        gemma3_gpu_sync(gpu);
-        gemma3_gpu_read_buffer(gpu, &y_buf, y, M * sizeof(float));
-
-        gemma3_gpu_destroy_buffer(&x_buf);
-        gemma3_gpu_destroy_buffer(&y_buf);
-        return;
-    }
-#endif
 #ifdef USE_THREADS
     if (pool) {
         gemma3_matvec_bf16_mt(y, A, x, M, K, scratch, (gemma3_thread_pool *)pool);
         return;
     }
 #endif
-#if !defined(USE_WEBGPU) && !defined(USE_THREADS)
     (void)pool;
-#endif
     gemma3_matvec_bf16(y, A, x, M, K, scratch);
 }
 
@@ -414,6 +388,519 @@ static void layer_mlp(
 }
 
 /* ============================================================================
+ * Phase 3: Persistent Weight Upload
+ *
+ * Upload all model weights to GPU VRAM at init time (~6GB for Gemma 3 4B).
+ * 13 buffers per layer x 34 layers = 442 persistent GPU buffers.
+ * Falls back to Phase 2 (per-layer upload) if allocation fails.
+ * ========================================================================== */
+
+#ifdef USE_WEBGPU
+static int upload_weights_to_gpu(gemma3_gpu_context *gpu,
+                                  const gemma3_weights_t *weights,
+                                  const gemma3_config *cfg) {
+    int num_layers = cfg->num_layers;
+    int hidden_size = cfg->hidden_size;
+    int intermediate_size = cfg->intermediate_size;
+    int num_heads = cfg->num_heads;
+    int num_kv_heads = cfg->num_kv_heads;
+    int head_dim = cfg->head_dim;
+
+    size_t q_weight_bytes = (size_t)(num_heads * head_dim) * hidden_size * sizeof(uint16_t);
+    size_t kv_weight_bytes = (size_t)(num_kv_heads * head_dim) * hidden_size * sizeof(uint16_t);
+    size_t o_weight_bytes = (size_t)hidden_size * (num_heads * head_dim) * sizeof(uint16_t);
+    size_t gate_weight_bytes = (size_t)intermediate_size * hidden_size * sizeof(uint16_t);
+    size_t norm_weight_bytes = (size_t)hidden_size * sizeof(uint16_t);
+    size_t qk_norm_bytes = (size_t)head_dim * sizeof(uint16_t);
+
+    WGPUBufferUsage storage_read = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+
+    /* Allocate layer_weights array */
+    gpu->layer_weights = (void *)calloc(num_layers, sizeof(gpu->layer_weights[0]));
+    if (!gpu->layer_weights) {
+        fprintf(stderr, "Phase 3: Failed to allocate layer_weights array\n");
+        return -1;
+    }
+
+    gpu->num_weight_layers = 0;
+    gpu->weights_resident = 0;
+
+    size_t total_uploaded = 0;
+
+    /* Allocate and upload per-layer weights */
+    for (int l = 0; l < num_layers; l++) {
+        /* Create all 13 buffers */
+        gpu->layer_weights[l].q_proj = gemma3_gpu_create_buffer(gpu, q_weight_bytes, storage_read);
+        gpu->layer_weights[l].k_proj = gemma3_gpu_create_buffer(gpu, kv_weight_bytes, storage_read);
+        gpu->layer_weights[l].v_proj = gemma3_gpu_create_buffer(gpu, kv_weight_bytes, storage_read);
+        gpu->layer_weights[l].o_proj = gemma3_gpu_create_buffer(gpu, o_weight_bytes, storage_read);
+        gpu->layer_weights[l].gate_proj = gemma3_gpu_create_buffer(gpu, gate_weight_bytes, storage_read);
+        gpu->layer_weights[l].up_proj = gemma3_gpu_create_buffer(gpu, gate_weight_bytes, storage_read);
+        gpu->layer_weights[l].down_proj = gemma3_gpu_create_buffer(gpu, gate_weight_bytes, storage_read);
+        gpu->layer_weights[l].input_layernorm = gemma3_gpu_create_buffer(gpu, norm_weight_bytes, storage_read);
+        gpu->layer_weights[l].post_attn_ln = gemma3_gpu_create_buffer(gpu, norm_weight_bytes, storage_read);
+        gpu->layer_weights[l].pre_ff_ln = gemma3_gpu_create_buffer(gpu, norm_weight_bytes, storage_read);
+        gpu->layer_weights[l].post_ff_ln = gemma3_gpu_create_buffer(gpu, norm_weight_bytes, storage_read);
+        gpu->layer_weights[l].q_norm = gemma3_gpu_create_buffer(gpu, qk_norm_bytes, storage_read);
+        gpu->layer_weights[l].k_norm = gemma3_gpu_create_buffer(gpu, qk_norm_bytes, storage_read);
+
+        /* Check all buffers were created */
+        if (!gpu->layer_weights[l].q_proj.buffer || !gpu->layer_weights[l].k_proj.buffer ||
+            !gpu->layer_weights[l].v_proj.buffer || !gpu->layer_weights[l].o_proj.buffer ||
+            !gpu->layer_weights[l].gate_proj.buffer || !gpu->layer_weights[l].up_proj.buffer ||
+            !gpu->layer_weights[l].down_proj.buffer || !gpu->layer_weights[l].input_layernorm.buffer ||
+            !gpu->layer_weights[l].post_attn_ln.buffer || !gpu->layer_weights[l].pre_ff_ln.buffer ||
+            !gpu->layer_weights[l].post_ff_ln.buffer || !gpu->layer_weights[l].q_norm.buffer ||
+            !gpu->layer_weights[l].k_norm.buffer) {
+            fprintf(stderr, "Phase 3: GPU buffer allocation failed at layer %d, falling back to Phase 2\n", l);
+            /* Clean up partially allocated layer */
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].q_proj);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].k_proj);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].v_proj);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].o_proj);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].gate_proj);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].up_proj);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].down_proj);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].input_layernorm);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].post_attn_ln);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].pre_ff_ln);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].post_ff_ln);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].q_norm);
+            gemma3_gpu_destroy_buffer(&gpu->layer_weights[l].k_norm);
+            /* Clean up previously completed layers */
+            for (int j = 0; j < l; j++) {
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].q_proj);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].k_proj);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].v_proj);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].o_proj);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].gate_proj);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].up_proj);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].down_proj);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].input_layernorm);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].post_attn_ln);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].pre_ff_ln);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].post_ff_ln);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].q_norm);
+                gemma3_gpu_destroy_buffer(&gpu->layer_weights[j].k_norm);
+            }
+            free(gpu->layer_weights);
+            gpu->layer_weights = NULL;
+            gpu->num_weight_layers = 0;
+            return -1;
+        }
+
+        /* Upload weight data */
+        gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].q_proj,
+                                weights->layers[l].q_proj, q_weight_bytes);
+        gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].k_proj,
+                                weights->layers[l].k_proj, kv_weight_bytes);
+        gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].v_proj,
+                                weights->layers[l].v_proj, kv_weight_bytes);
+        gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].o_proj,
+                                weights->layers[l].o_proj, o_weight_bytes);
+        gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].gate_proj,
+                                weights->layers[l].gate_proj, gate_weight_bytes);
+        gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].up_proj,
+                                weights->layers[l].up_proj, gate_weight_bytes);
+        gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].down_proj,
+                                weights->layers[l].down_proj, gate_weight_bytes);
+        gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].input_layernorm,
+                                weights->layers[l].input_layernorm, norm_weight_bytes);
+        if (weights->layers[l].post_attention_layernorm)
+            gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].post_attn_ln,
+                                    weights->layers[l].post_attention_layernorm, norm_weight_bytes);
+        if (weights->layers[l].pre_feedforward_layernorm)
+            gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].pre_ff_ln,
+                                    weights->layers[l].pre_feedforward_layernorm, norm_weight_bytes);
+        if (weights->layers[l].post_feedforward_layernorm)
+            gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].post_ff_ln,
+                                    weights->layers[l].post_feedforward_layernorm, norm_weight_bytes);
+        if (weights->layers[l].q_norm)
+            gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].q_norm,
+                                    weights->layers[l].q_norm, qk_norm_bytes);
+        if (weights->layers[l].k_norm)
+            gemma3_gpu_write_buffer(gpu, &gpu->layer_weights[l].k_norm,
+                                    weights->layers[l].k_norm, qk_norm_bytes);
+
+        gpu->num_weight_layers = l + 1;
+        total_uploaded += q_weight_bytes + kv_weight_bytes * 2 + o_weight_bytes +
+                          gate_weight_bytes * 3 + norm_weight_bytes * 4 + qk_norm_bytes * 2;
+    }
+
+    /* Upload final RMSNorm weight */
+    gpu->buf_final_norm = gemma3_gpu_create_buffer(gpu, norm_weight_bytes, storage_read);
+    if (!gpu->buf_final_norm.buffer) {
+        fprintf(stderr, "Phase 3: Failed to allocate final norm buffer, falling back to Phase 2\n");
+        return -1;
+    }
+    gemma3_gpu_write_buffer(gpu, &gpu->buf_final_norm, weights->norm, norm_weight_bytes);
+    total_uploaded += norm_weight_bytes;
+
+    /* Wait for all uploads to complete */
+    wgpuDevicePoll(gpu->device, 1, NULL);
+
+    gpu->weights_resident = 1;
+    fprintf(stderr, "Phase 3: Uploaded %.1f MB of weights to GPU (%d layers)\n",
+            (double)total_uploaded / (1024.0 * 1024.0), num_layers);
+    return 0;
+}
+#endif /* USE_WEBGPU */
+
+/* ============================================================================
+ * GPU-Optimized Forward Pass
+ *
+ * Phase 3 (weights_resident=1): Single-submit, 1 sync per token.
+ *   All ~750 dispatches recorded into 1 command encoder. No weight transfers.
+ *   Params ring buffer holds all dispatches (749 x 256B = 192KB < 256KB).
+ *
+ * Phase 2 fallback (weights_resident=0): 1 sync per layer = 35 syncs/token.
+ *   Uploads 13 weight buffers per layer, then dispatches ~22 ops.
+ *
+ * Hidden state stays on GPU between layers. KV cache is GPU-resident.
+ * Embedding on CPU (upload once). Final logit projection on CPU (readback once).
+ * ========================================================================== */
+
+#ifdef USE_WEBGPU
+static int gemma3_transformer_forward_gpu(
+    float *logits,
+    int token_id,
+    int pos,
+    const gemma3_weights_t *weights,
+    gemma3_kv_cache *cache,
+    activation_buffers *buf,
+    const gemma3_config *cfg,
+    int compute_logits,
+    const float *rope_freqs_local,
+    const float *rope_freqs_global,
+    gemma3_gpu_context *gpu,
+    void *thread_pool
+) {
+    int hidden_size = cfg->hidden_size;
+    int intermediate_size = cfg->intermediate_size;
+    int vocab_size = cfg->vocab_size;
+    int num_heads = cfg->num_heads;
+    int num_kv_heads = cfg->num_kv_heads;
+    int head_dim = cfg->head_dim;
+    int q_size = num_heads * head_dim;
+    int kv_size = num_kv_heads * head_dim;
+
+    size_t q_weight_bytes = (size_t)q_size * hidden_size * sizeof(uint16_t);
+    size_t kv_weight_bytes = (size_t)kv_size * hidden_size * sizeof(uint16_t);
+    size_t o_weight_bytes = (size_t)hidden_size * q_size * sizeof(uint16_t);
+    size_t gate_weight_bytes = (size_t)intermediate_size * hidden_size * sizeof(uint16_t);
+    size_t norm_weight_bytes = (size_t)hidden_size * sizeof(uint16_t);
+    size_t qk_norm_bytes = (size_t)head_dim * sizeof(uint16_t);
+
+    (void)rope_freqs_local;
+    (void)rope_freqs_global;
+
+    /* Token embedding lookup (BF16, CPU) then upload once */
+    gemma3_embed_bf16(buf->x, weights->embed_tokens, token_id, hidden_size);
+    float embed_scale = sqrtf((float)hidden_size);
+    for (int i = 0; i < hidden_size; i++) {
+        buf->x[i] *= embed_scale;
+    }
+    gemma3_gpu_write_buffer(gpu, &gpu->buf_x, buf->x, hidden_size * sizeof(float));
+
+    if (gpu->weights_resident) {
+        /* ==============================================================
+         * Phase 3: Single-submit forward pass (1 sync per token)
+         *
+         * All weights are persistent on GPU. Record ALL layer dispatches
+         * into one command buffer, then submit once.
+         * ~749 dispatches, 1 submit, 1 sync, 1 readback.
+         * ============================================================== */
+
+        gemma3_gpu_begin_commands(gpu);
+
+        for (int l = 0; l < cfg->num_layers; l++) {
+            int is_global = gemma3_is_global_layer(l);
+            int cache_pos = is_global ? pos : (pos % cfg->sliding_window);
+            int seq_len = is_global ? (pos + 1) : ((pos < cfg->sliding_window) ? pos + 1 : cfg->sliding_window);
+            float scale = 1.0f / sqrtf((float)head_dim);
+
+            /* Persistent weight references (no upload needed) */
+            gemma3_gpu_buffer *w_input_ln = &gpu->layer_weights[l].input_layernorm;
+            gemma3_gpu_buffer *w_q = &gpu->layer_weights[l].q_proj;
+            gemma3_gpu_buffer *w_k = &gpu->layer_weights[l].k_proj;
+            gemma3_gpu_buffer *w_v = &gpu->layer_weights[l].v_proj;
+            gemma3_gpu_buffer *w_o = &gpu->layer_weights[l].o_proj;
+            gemma3_gpu_buffer *w_qn = &gpu->layer_weights[l].q_norm;
+            gemma3_gpu_buffer *w_kn = &gpu->layer_weights[l].k_norm;
+            gemma3_gpu_buffer *w_post_attn = &gpu->layer_weights[l].post_attn_ln;
+            gemma3_gpu_buffer *w_pre_ff = &gpu->layer_weights[l].pre_ff_ln;
+            gemma3_gpu_buffer *w_gate = &gpu->layer_weights[l].gate_proj;
+            gemma3_gpu_buffer *w_up = &gpu->layer_weights[l].up_proj;
+            gemma3_gpu_buffer *w_down = &gpu->layer_weights[l].down_proj;
+            gemma3_gpu_buffer *w_post_ff = &gpu->layer_weights[l].post_ff_ln;
+
+            /* --- Attention block --- */
+
+            /* 1. Pre-attention RMSNorm */
+            gemma3_rmsnorm_bf16_dispatch_gpu(gpu, &gpu->buf_x_norm, &gpu->buf_x,
+                                              w_input_ln, norm_weight_bytes,
+                                              hidden_size, cfg->rmsnorm_eps);
+
+            /* 2-4. QKV projections */
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_q, w_q,
+                                             q_weight_bytes, &gpu->buf_x_norm,
+                                             q_size, hidden_size);
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_k, w_k,
+                                             kv_weight_bytes, &gpu->buf_x_norm,
+                                             kv_size, hidden_size);
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_v, w_v,
+                                             kv_weight_bytes, &gpu->buf_x_norm,
+                                             kv_size, hidden_size);
+
+            /* 5-6. QK normalization */
+            gemma3_multi_head_rmsnorm_dispatch_gpu(gpu, &gpu->buf_q,
+                                                    w_qn, qk_norm_bytes,
+                                                    head_dim, num_heads, cfg->rmsnorm_eps);
+            gemma3_multi_head_rmsnorm_dispatch_gpu(gpu, &gpu->buf_k,
+                                                    w_kn, qk_norm_bytes,
+                                                    head_dim, num_kv_heads, cfg->rmsnorm_eps);
+
+            /* 7-8. RoPE */
+            {
+                gemma3_gpu_buffer *rope_table = is_global ? &gpu->buf_rope_global : &gpu->buf_rope_local;
+                gemma3_rope_precomputed_dispatch_gpu(gpu, &gpu->buf_q, rope_table,
+                                                      num_heads, head_dim, pos);
+                gemma3_rope_precomputed_dispatch_gpu(gpu, &gpu->buf_k, rope_table,
+                                                      num_kv_heads, head_dim, pos);
+            }
+
+            /* 9. KV cache write */
+            gemma3_kv_cache_write_dispatch_gpu(gpu,
+                                                &gpu->buf_k, &gpu->buf_v,
+                                                &gpu->gpu_kv_cache[l].k, &gpu->gpu_kv_cache[l].v,
+                                                num_kv_heads, head_dim, cache_pos);
+
+            /* 10. Attention mask */
+            gemma3_mask_dispatch_gpu(gpu, &gpu->buf_mask, pos, seq_len,
+                                      cfg->sliding_window, is_global);
+
+            /* 11. GQA */
+            gemma3_gqa_dispatch_gpu(gpu, &gpu->buf_attn_out, &gpu->buf_q,
+                                     &gpu->gpu_kv_cache[l].k, &gpu->gpu_kv_cache[l].v,
+                                     num_heads, num_kv_heads, seq_len, head_dim,
+                                     scale, &gpu->buf_mask);
+
+            /* --- Post-attention + MLP block --- */
+
+            /* 12. O projection */
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_proj_out, w_o,
+                                             o_weight_bytes, &gpu->buf_attn_out,
+                                             hidden_size, q_size);
+
+            /* 13. Post-attention RMSNorm (non-aliasing v2) */
+            gemma3_rmsnorm_bf16_inplace_v2_dispatch_gpu(gpu, &gpu->buf_proj_out,
+                                                          w_post_attn, norm_weight_bytes,
+                                                          hidden_size, cfg->rmsnorm_eps);
+
+            /* 14. Residual: x += proj_out (in-place, non-aliasing) */
+            gemma3_vec_add_inplace_dispatch_gpu(gpu, &gpu->buf_x, &gpu->buf_proj_out, hidden_size);
+
+            /* 15. Pre-feedforward RMSNorm */
+            gemma3_rmsnorm_bf16_dispatch_gpu(gpu, &gpu->buf_x_norm, &gpu->buf_x,
+                                              w_pre_ff, norm_weight_bytes,
+                                              hidden_size, cfg->rmsnorm_eps);
+
+            /* 16-17. Gate + Up projections */
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_mlp_gate, w_gate,
+                                             gate_weight_bytes, &gpu->buf_x_norm,
+                                             intermediate_size, hidden_size);
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_mlp_up, w_up,
+                                             gate_weight_bytes, &gpu->buf_x_norm,
+                                             intermediate_size, hidden_size);
+
+            /* 18. Fused GELU + Gate*Up: gate[i] = gelu(gate[i]) * up[i] */
+            gemma3_gelu_mul_dispatch_gpu(gpu, &gpu->buf_mlp_gate,
+                                           &gpu->buf_mlp_up, intermediate_size);
+
+            /* 19. Down projection */
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_mlp_out, w_down,
+                                             gate_weight_bytes, &gpu->buf_mlp_gate,
+                                             hidden_size, intermediate_size);
+
+            /* 21. Post-feedforward RMSNorm (non-aliasing v2) */
+            gemma3_rmsnorm_bf16_inplace_v2_dispatch_gpu(gpu, &gpu->buf_mlp_out,
+                                                          w_post_ff, norm_weight_bytes,
+                                                          hidden_size, cfg->rmsnorm_eps);
+
+            /* 22. Residual: x += mlp_out (in-place, non-aliasing) */
+            gemma3_vec_add_inplace_dispatch_gpu(gpu, &gpu->buf_x, &gpu->buf_mlp_out, hidden_size);
+
+            /* Keep CPU-side cache pos in sync */
+            cache->layers[l].pos = pos + 1;
+        }
+
+        /* Final RMSNorm (using persistent final_norm buffer) */
+        if (compute_logits) {
+            gemma3_rmsnorm_bf16_dispatch_gpu(gpu, &gpu->buf_x_norm, &gpu->buf_x,
+                                              &gpu->buf_final_norm, norm_weight_bytes,
+                                              hidden_size, cfg->rmsnorm_eps);
+        }
+
+        /* Single flush + sync for ALL 34 layers + final norm */
+        gemma3_gpu_flush_commands(gpu);
+        gemma3_gpu_sync(gpu);
+
+        /* Logit projection on CPU (embed table ~1.28GB, stays on host) */
+        if (compute_logits) {
+            gemma3_gpu_read_buffer(gpu, &gpu->buf_x_norm, buf->x_norm, hidden_size * sizeof(float));
+            matvec_bf16_dispatch(logits, weights->embed_tokens, buf->x_norm,
+                                 vocab_size, hidden_size, buf->matvec_tmp, thread_pool);
+        }
+
+    } else {
+        /* ==============================================================
+         * Phase 2 fallback: Per-layer weight upload (35 syncs/token)
+         * ============================================================== */
+
+        for (int l = 0; l < cfg->num_layers; l++) {
+            int is_global = gemma3_is_global_layer(l);
+            int cache_pos = is_global ? pos : (pos % cfg->sliding_window);
+            int seq_len = is_global ? (pos + 1) : ((pos < cfg->sliding_window) ? pos + 1 : cfg->sliding_window);
+            float scale = 1.0f / sqrtf((float)head_dim);
+
+            /* Upload all 13 weight buffers for this layer */
+            gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_norm_0,
+                                    weights->layers[l].input_layernorm, norm_weight_bytes);
+            if (weights->layers[l].post_attention_layernorm)
+                gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_norm_1,
+                                        weights->layers[l].post_attention_layernorm, norm_weight_bytes);
+            if (weights->layers[l].pre_feedforward_layernorm)
+                gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_norm_2,
+                                        weights->layers[l].pre_feedforward_layernorm, norm_weight_bytes);
+            if (weights->layers[l].post_feedforward_layernorm)
+                gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_norm_3,
+                                        weights->layers[l].post_feedforward_layernorm, norm_weight_bytes);
+
+            gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_medium,
+                                    weights->layers[l].q_proj, q_weight_bytes);
+            gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_small_0,
+                                    weights->layers[l].k_proj, kv_weight_bytes);
+            gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_small_1,
+                                    weights->layers[l].v_proj, kv_weight_bytes);
+
+            if (weights->layers[l].q_norm)
+                gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_qk_norm_q,
+                                        weights->layers[l].q_norm, qk_norm_bytes);
+            if (weights->layers[l].k_norm)
+                gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_qk_norm_k,
+                                        weights->layers[l].k_norm, qk_norm_bytes);
+
+            gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_medium_1,
+                                    weights->layers[l].o_proj, o_weight_bytes);
+            gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_large_0,
+                                    weights->layers[l].gate_proj, gate_weight_bytes);
+            gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_large_1,
+                                    weights->layers[l].up_proj, gate_weight_bytes);
+            gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_large_2,
+                                    weights->layers[l].down_proj, gate_weight_bytes);
+
+            /* Record all dispatches */
+            gemma3_gpu_begin_commands(gpu);
+
+            gemma3_rmsnorm_bf16_dispatch_gpu(gpu, &gpu->buf_x_norm, &gpu->buf_x,
+                                              &gpu->buf_weight_norm_0, norm_weight_bytes,
+                                              hidden_size, cfg->rmsnorm_eps);
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_q, &gpu->buf_weight_medium,
+                                             q_weight_bytes, &gpu->buf_x_norm,
+                                             q_size, hidden_size);
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_k, &gpu->buf_weight_small_0,
+                                             kv_weight_bytes, &gpu->buf_x_norm,
+                                             kv_size, hidden_size);
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_v, &gpu->buf_weight_small_1,
+                                             kv_weight_bytes, &gpu->buf_x_norm,
+                                             kv_size, hidden_size);
+
+            if (weights->layers[l].q_norm)
+                gemma3_multi_head_rmsnorm_dispatch_gpu(gpu, &gpu->buf_q,
+                                                        &gpu->buf_weight_qk_norm_q, qk_norm_bytes,
+                                                        head_dim, num_heads, cfg->rmsnorm_eps);
+            if (weights->layers[l].k_norm)
+                gemma3_multi_head_rmsnorm_dispatch_gpu(gpu, &gpu->buf_k,
+                                                        &gpu->buf_weight_qk_norm_k, qk_norm_bytes,
+                                                        head_dim, num_kv_heads, cfg->rmsnorm_eps);
+
+            {
+                gemma3_gpu_buffer *rope_table = is_global ? &gpu->buf_rope_global : &gpu->buf_rope_local;
+                gemma3_rope_precomputed_dispatch_gpu(gpu, &gpu->buf_q, rope_table,
+                                                      num_heads, head_dim, pos);
+                gemma3_rope_precomputed_dispatch_gpu(gpu, &gpu->buf_k, rope_table,
+                                                      num_kv_heads, head_dim, pos);
+            }
+
+            gemma3_kv_cache_write_dispatch_gpu(gpu,
+                                                &gpu->buf_k, &gpu->buf_v,
+                                                &gpu->gpu_kv_cache[l].k, &gpu->gpu_kv_cache[l].v,
+                                                num_kv_heads, head_dim, cache_pos);
+            gemma3_mask_dispatch_gpu(gpu, &gpu->buf_mask, pos, seq_len,
+                                      cfg->sliding_window, is_global);
+            gemma3_gqa_dispatch_gpu(gpu, &gpu->buf_attn_out, &gpu->buf_q,
+                                     &gpu->gpu_kv_cache[l].k, &gpu->gpu_kv_cache[l].v,
+                                     num_heads, num_kv_heads, seq_len, head_dim,
+                                     scale, &gpu->buf_mask);
+
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_proj_out, &gpu->buf_weight_medium_1,
+                                             o_weight_bytes, &gpu->buf_attn_out,
+                                             hidden_size, q_size);
+            if (weights->layers[l].post_attention_layernorm)
+                gemma3_rmsnorm_bf16_inplace_v2_dispatch_gpu(gpu, &gpu->buf_proj_out,
+                                                              &gpu->buf_weight_norm_1, norm_weight_bytes,
+                                                              hidden_size, cfg->rmsnorm_eps);
+            gemma3_vec_add_inplace_dispatch_gpu(gpu, &gpu->buf_x, &gpu->buf_proj_out, hidden_size);
+
+            if (weights->layers[l].pre_feedforward_layernorm)
+                gemma3_rmsnorm_bf16_dispatch_gpu(gpu, &gpu->buf_x_norm, &gpu->buf_x,
+                                                  &gpu->buf_weight_norm_2, norm_weight_bytes,
+                                                  hidden_size, cfg->rmsnorm_eps);
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_mlp_gate, &gpu->buf_weight_large_0,
+                                             gate_weight_bytes, &gpu->buf_x_norm,
+                                             intermediate_size, hidden_size);
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_mlp_up, &gpu->buf_weight_large_1,
+                                             gate_weight_bytes, &gpu->buf_x_norm,
+                                             intermediate_size, hidden_size);
+            gemma3_gelu_mul_dispatch_gpu(gpu, &gpu->buf_mlp_gate,
+                                           &gpu->buf_mlp_up, intermediate_size);
+            gemma3_matvec_bf16_dispatch_gpu(gpu, &gpu->buf_mlp_out, &gpu->buf_weight_large_2,
+                                             gate_weight_bytes, &gpu->buf_mlp_gate,
+                                             hidden_size, intermediate_size);
+            if (weights->layers[l].post_feedforward_layernorm)
+                gemma3_rmsnorm_bf16_inplace_v2_dispatch_gpu(gpu, &gpu->buf_mlp_out,
+                                                              &gpu->buf_weight_norm_3, norm_weight_bytes,
+                                                              hidden_size, cfg->rmsnorm_eps);
+            gemma3_vec_add_inplace_dispatch_gpu(gpu, &gpu->buf_x, &gpu->buf_mlp_out, hidden_size);
+
+            gemma3_gpu_flush_commands(gpu);
+            gemma3_gpu_sync(gpu);
+
+            cache->layers[l].pos = pos + 1;
+        }
+
+        /* Final: norm + logits */
+        if (compute_logits) {
+            gemma3_gpu_write_buffer(gpu, &gpu->buf_weight_norm_0, weights->norm, norm_weight_bytes);
+            gemma3_gpu_begin_commands(gpu);
+            gemma3_rmsnorm_bf16_dispatch_gpu(gpu, &gpu->buf_x_norm, &gpu->buf_x,
+                                              &gpu->buf_weight_norm_0, norm_weight_bytes,
+                                              hidden_size, cfg->rmsnorm_eps);
+            gemma3_gpu_flush_commands(gpu);
+            gemma3_gpu_sync(gpu);
+
+            gemma3_gpu_read_buffer(gpu, &gpu->buf_x_norm, buf->x_norm, hidden_size * sizeof(float));
+            matvec_bf16_dispatch(logits, weights->embed_tokens, buf->x_norm,
+                                 vocab_size, hidden_size, buf->matvec_tmp, thread_pool);
+        }
+    }
+
+    cache->current_pos = pos + 1;
+    return 0;
+}
+#endif /* USE_WEBGPU */
+
+/* ============================================================================
  * Full Forward Pass
  * ========================================================================== */
 
@@ -561,8 +1048,6 @@ static int gemma3_transformer_prefill_batched(
     const float *rope_freqs_global,
     void *thread_pool
 ) {
-    (void)thread_pool;
-
     int hidden_size = cfg->hidden_size;
     int intermediate_size = cfg->intermediate_size;
     int num_heads = cfg->num_heads;
@@ -791,8 +1276,8 @@ static int gemma3_transformer_prefill_batched(
     int last = N - 1;
     gemma3_rmsnorm_bf16(buf->x_norm, X + last * hidden_size, weights->norm,
                         hidden_size, cfg->rmsnorm_eps);
-    gemma3_matvec_bf16(logits, weights->embed_tokens, buf->x_norm,
-                       cfg->vocab_size, hidden_size, buf->matvec_tmp);
+    matvec_bf16_dispatch(logits, weights->embed_tokens, buf->x_norm,
+                         cfg->vocab_size, hidden_size, buf->matvec_tmp, thread_pool);
 
     free(batch_buf);
     free(weight_f32);
@@ -921,8 +1406,20 @@ gemma3_transformer *gemma3_transformer_create(
                                 cfg->num_heads,
                                 cfg->num_kv_heads,
                                 cfg->head_dim,
-                                max_context);
-        fprintf(stderr, "WebGPU: Initialized (%s)\n", gemma3_gpu_device_name(t->gpu_ctx));
+                                max_context,
+                                cfg->num_layers,
+                                cfg->sliding_window);
+        /* Upload precomputed RoPE tables to GPU (Phase 2) */
+        gemma3_gpu_upload_rope_tables(t->gpu_ctx, t->rope_freqs_local, t->rope_freqs_global);
+
+        /* Upload all model weights to GPU for persistent residency (Phase 3) */
+        if (upload_weights_to_gpu(t->gpu_ctx, t->weights, cfg) == 0) {
+            fprintf(stderr, "WebGPU: Phase 3 active -- all weights resident on GPU (%s)\n",
+                    gemma3_gpu_device_name(t->gpu_ctx));
+        } else {
+            fprintf(stderr, "WebGPU: Phase 2 fallback -- per-layer weight upload (%s)\n",
+                    gemma3_gpu_device_name(t->gpu_ctx));
+        }
     } else {
         fprintf(stderr, "WebGPU: Not available, falling back to CPU\n");
     }
@@ -952,12 +1449,23 @@ int gemma3_transformer_forward_token(
     int pos,
     float *logits
 ) {
-    void *pool = NULL;
 #ifdef USE_WEBGPU
-    if (t->gpu_ctx) pool = t->gpu_ctx;  /* WebGPU takes priority */
-#endif
+    /* Use the optimized GPU forward pass unless GEMMA3_NO_GPU is set */
+    if (t->gpu_ctx && !getenv("GEMMA3_NO_GPU")) {
+        void *tp = NULL;
 #ifdef USE_THREADS
-    if (!pool) pool = t->thread_pool;   /* Fall back to CPU threads */
+        tp = t->thread_pool;
+#endif
+        return gemma3_transformer_forward_gpu(
+            logits, token_id, pos,
+            t->weights, t->cache, t->buffers, &t->config, 1,
+            t->rope_freqs_local, t->rope_freqs_global, t->gpu_ctx, tp
+        );
+    }
+#endif
+    void *pool = NULL;
+#ifdef USE_THREADS
+    pool = t->thread_pool;
 #endif
     return gemma3_transformer_forward(
         logits, token_id, pos,
@@ -974,17 +1482,42 @@ int gemma3_transformer_prefill_tokens(
     float *logits
 ) {
     void *pool = NULL;
-#ifdef USE_WEBGPU
-    if (t->gpu_ctx) pool = t->gpu_ctx;  /* WebGPU takes priority */
-#endif
 #ifdef USE_THREADS
-    if (!pool) pool = t->thread_pool;   /* Fall back to CPU threads */
+    pool = t->thread_pool;   /* CPU threads for prefill */
 #endif
-    return gemma3_transformer_prefill(
+    int result = gemma3_transformer_prefill(
         logits, tokens, num_tokens, start_pos,
         t->weights, t->cache, t->buffers, &t->config,
         t->rope_freqs_local, t->rope_freqs_global, pool
     );
+
+#ifdef USE_WEBGPU
+    /* After CPU prefill, copy the filled KV cache to GPU so GPU generation
+     * reads valid K/V vectors for all prefilled positions. Without this,
+     * the GPU GQA kernel reads empty/garbage data for positions 0..num_tokens-1. */
+    if (t->gpu_ctx && result == 0) {
+        gemma3_gpu_context *gpu = t->gpu_ctx;
+        int kv_size = t->config.num_kv_heads * t->config.head_dim;
+        int end_pos = start_pos + num_tokens;
+
+        for (int l = 0; l < t->config.num_layers; l++) {
+            /* Copy min(filled_positions, layer_cache_size) entries.
+             * Global layers: cache_pos == pos (simple append up to max_context).
+             * Local layers: ring buffer of sliding_window entries. */
+            int layer_max = gpu->gpu_kv_cache[l].max_seq;
+            int copy_entries = end_pos < layer_max ? end_pos : layer_max;
+            size_t copy_bytes = (size_t)copy_entries * kv_size * sizeof(float);
+
+            gemma3_gpu_write_buffer(gpu, &gpu->gpu_kv_cache[l].k,
+                                    t->cache->layers[l].k, copy_bytes);
+            gemma3_gpu_write_buffer(gpu, &gpu->gpu_kv_cache[l].v,
+                                    t->cache->layers[l].v, copy_bytes);
+        }
+        fprintf(stderr, "WebGPU: Copied KV cache to GPU after prefill (%d tokens)\n", num_tokens);
+    }
+#endif
+
+    return result;
 }
 
 void gemma3_transformer_reset(gemma3_transformer *t) {
