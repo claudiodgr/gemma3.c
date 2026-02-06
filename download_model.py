@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Download the Gemma 3 4B IT model from Hugging Face."""
 
 import argparse

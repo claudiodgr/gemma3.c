@@ -31,17 +31,34 @@
  * The caller should set pool to either a gemma3_thread_pool* or gemma3_gpu_context*
  * depending on the build configuration.
  */
+/* ============================================================================
+ * Inference Context (Passes through call chain)
+ * ========================================================================== */
+
+typedef struct {
+    void *gpu_ctx;      /* gemma3_gpu_context* */
+    void *thread_pool;  /* gemma3_thread_pool* */
+} gemma3_inference_ctx;
+
+/*
+ * Helper to dispatch matvec_bf16 to WebGPU, threaded, or single-threaded path.
+ *
+ * Priority: WebGPU > Threads > Single-threaded
+ */
 static inline void matvec_bf16_dispatch(float *y, const uint16_t *A, const float *x,
-                                         int M, int K, float *scratch, void *pool) {
+                                         int M, int K, float *scratch, void *ctx_void) {
+    gemma3_inference_ctx *ctx = (gemma3_inference_ctx *)ctx_void;
+
 #ifdef USE_WEBGPU
     /* WebGPU path: pool is actually a gemma3_gpu_context* */
-    if (pool) {
-        gemma3_gpu_context *gpu = (gemma3_gpu_context *)pool;
+    if (ctx && ctx->gpu_ctx) {
+        gemma3_gpu_context *gpu = (gemma3_gpu_context *)ctx->gpu_ctx;
         /* For GPU execution, we use pre-allocated buffers from the context */
         /* Note: This is a simplified dispatch - full integration would manage
          * GPU buffers more efficiently without CPU-GPU copies per operation */
 
         /* Create temporary GPU buffers and execute */
+        // fprintf(stderr, "DEBUG: Dispatching to GPU\n");
         gemma3_gpu_buffer y_buf = gemma3_gpu_create_buffer(gpu, M * sizeof(float),
             WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
         gemma3_gpu_buffer x_buf = gemma3_gpu_create_buffer(gpu, K * sizeof(float),
@@ -58,13 +75,13 @@ static inline void matvec_bf16_dispatch(float *y, const uint16_t *A, const float
     }
 #endif
 #ifdef USE_THREADS
-    if (pool) {
-        gemma3_matvec_bf16_mt(y, A, x, M, K, scratch, (gemma3_thread_pool *)pool);
+    if (ctx && ctx->thread_pool) {
+        gemma3_matvec_bf16_mt(y, A, x, M, K, scratch, (gemma3_thread_pool *)ctx->thread_pool);
         return;
     }
 #endif
 #if !defined(USE_WEBGPU) && !defined(USE_THREADS)
-    (void)pool;
+    (void)ctx;
 #endif
     gemma3_matvec_bf16(y, A, x, M, K, scratch);
 }
@@ -859,6 +876,9 @@ typedef struct gemma3_transformer {
 #ifdef USE_THREADS
     gemma3_thread_pool *thread_pool;
 #endif
+#ifdef USE_WEBGPU
+    gemma3_gpu_context *gpu_context;
+#endif
 } gemma3_transformer;
 
 gemma3_transformer *gemma3_transformer_create(
@@ -904,6 +924,26 @@ gemma3_transformer *gemma3_transformer_create(
     t->thread_pool = gemma3_thread_pool_create(0); /* 0 = auto-detect CPU count */
 #endif
 
+#ifdef USE_WEBGPU
+    t->gpu_context = gemma3_gpu_init();
+    if (!t->gpu_context) {
+        fprintf(stderr, "Warning: Failed to initialize WebGPU, falling back to CPU\n");
+    } else {
+        if (gemma3_gpu_init_buffers(t->gpu_context, 
+                                   cfg->hidden_size,
+                                   cfg->intermediate_size,
+                                   cfg->vocab_size,
+                                   cfg->num_heads,
+                                   cfg->num_kv_heads,
+                                   cfg->head_dim,
+                                   max_context) != 0) {
+            fprintf(stderr, "Warning: Failed to initialize WebGPU buffers, falling back to CPU\n");
+            gemma3_gpu_free(t->gpu_context);
+            t->gpu_context = NULL;
+        }
+    }
+#endif
+
     return t;
 }
 
@@ -911,6 +951,9 @@ void gemma3_transformer_destroy(gemma3_transformer *t) {
     if (!t) return;
 #ifdef USE_THREADS
     gemma3_thread_pool_destroy(t->thread_pool);
+#endif
+#ifdef USE_WEBGPU
+    gemma3_gpu_free(t->gpu_context);
 #endif
     gemma3_kv_cache_free(t->cache);
     free_buffers(t->buffers);
@@ -925,14 +968,18 @@ int gemma3_transformer_forward_token(
     int pos,
     float *logits
 ) {
-    void *pool = NULL;
-#ifdef USE_THREADS
-    pool = t->thread_pool;
+    gemma3_inference_ctx ctx = {0};
+#ifdef USE_WEBGPU
+    ctx.gpu_ctx = t->gpu_context;
 #endif
+#ifdef USE_THREADS
+    ctx.thread_pool = t->thread_pool;
+#endif
+
     return gemma3_transformer_forward(
         logits, token_id, pos,
         t->weights, t->cache, t->buffers, &t->config, 1,
-        t->rope_freqs_local, t->rope_freqs_global, pool
+        t->rope_freqs_local, t->rope_freqs_global, &ctx
     );
 }
 
@@ -943,14 +990,18 @@ int gemma3_transformer_prefill_tokens(
     int start_pos,
     float *logits
 ) {
-    void *pool = NULL;
-#ifdef USE_THREADS
-    pool = t->thread_pool;
+    gemma3_inference_ctx ctx = {0};
+#ifdef USE_WEBGPU
+    ctx.gpu_ctx = t->gpu_context;
 #endif
+#ifdef USE_THREADS
+    ctx.thread_pool = t->thread_pool;
+#endif
+
     return gemma3_transformer_prefill(
         logits, tokens, num_tokens, start_pos,
         t->weights, t->cache, t->buffers, &t->config,
-        t->rope_freqs_local, t->rope_freqs_global, pool
+        t->rope_freqs_local, t->rope_freqs_global, &ctx
     );
 }
 

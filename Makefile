@@ -124,7 +124,7 @@ shaders: shaders/gemma3_kernels.wgsl
 	@echo "Generating embedded shader source..."
 	@echo '// Auto-generated - do not edit' > shaders/gemma3_kernels.wgsl.inc
 	@echo '"\\' >> shaders/gemma3_kernels.wgsl.inc
-	@sed 's/"/\\"/g; s/$$/\\n\\/; s/\t/    /g' shaders/gemma3_kernels.wgsl >> shaders/gemma3_kernels.wgsl.inc
+	@tr -d '\r' < shaders/gemma3_kernels.wgsl | sed 's/"/\\"/g; s/$$/\\n\\/; s/\t/    /g' >> shaders/gemma3_kernels.wgsl.inc
 	@echo '"' >> shaders/gemma3_kernels.wgsl.inc
 	@echo "Shader source embedded in shaders/gemma3_kernels.wgsl.inc"
 

@@ -8,10 +8,22 @@
 #ifdef USE_WEBGPU
 
 #include "gemma3_webgpu.h"
+#include <webgpu/wgpu.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdarg.h>
+
+/* Helper for WGPUStringView */
+static inline WGPUStringView wgpu_str(const char *s) {
+    return (WGPUStringView){
+        .data = s,
+        .length = WGPU_STRLEN,
+    };
+}
 
 /* ============================================================================
  * Embedded Shader Source
@@ -66,40 +78,69 @@ const char *gemma3_gpu_get_error(void) {
  * WebGPU Callbacks
  * ========================================================================== */
 
-static void on_device_error(WGPUErrorType type, const char *message, void *userdata) {
-    (void)userdata;
+static void on_device_error(const WGPUDevice *device, WGPUErrorType type, WGPUStringView message, void *userdata, void *userdata2) {
+    (void)device; (void)userdata; (void)userdata2;
     const char *type_str = "Unknown";
     switch (type) {
         case WGPUErrorType_Validation: type_str = "Validation"; break;
         case WGPUErrorType_OutOfMemory: type_str = "OutOfMemory"; break;
         case WGPUErrorType_Internal: type_str = "Internal"; break;
         case WGPUErrorType_Unknown: type_str = "Unknown"; break;
-        case WGPUErrorType_DeviceLost: type_str = "DeviceLost"; break;
         default: break;
     }
-    set_gpu_error("Device error (%s): %s", type_str, message);
+    char msg_buf[512] = {0};
+    size_t len = message.length == WGPU_STRLEN ? (message.data ? strlen(message.data) : 0) : message.length;
+    if (len > sizeof(msg_buf) - 1) len = sizeof(msg_buf) - 1;
+    if (message.data) memcpy(msg_buf, message.data, len);
+
+    set_gpu_error("Device error (%s): %s", type_str, msg_buf);
 }
+
+typedef struct {
+    void **output;
+    bool *done;
+} RequestCtx;
 
 static void on_adapter_request(WGPURequestAdapterStatus status,
                                WGPUAdapter adapter,
-                               const char *message,
-                               void *userdata) {
+                               WGPUStringView message,
+                               void *userdata,
+                               void *userdata2) {
+    (void)userdata2;
+    RequestCtx *ctx = (RequestCtx *)userdata;
     if (status != WGPURequestAdapterStatus_Success) {
-        set_gpu_error("Adapter request failed: %s", message ? message : "unknown");
+        char msg_buf[512] = {0};
+        size_t len = message.length == WGPU_STRLEN ? (message.data ? strlen(message.data) : 0) : message.length;
+        if (len > sizeof(msg_buf) - 1) len = sizeof(msg_buf) - 1;
+        if (message.data) memcpy(msg_buf, message.data, len);
+        
+        set_gpu_error("Adapter request failed: %s", msg_buf);
+        *ctx->done = true;
         return;
     }
-    *(WGPUAdapter *)userdata = adapter;
+    *(WGPUAdapter *)ctx->output = adapter;
+    *ctx->done = true;
 }
 
 static void on_device_request(WGPURequestDeviceStatus status,
                               WGPUDevice device,
-                              const char *message,
-                              void *userdata) {
+                              WGPUStringView message,
+                              void *userdata,
+                              void *userdata2) {
+    (void)userdata2;
+    RequestCtx *ctx = (RequestCtx *)userdata;
     if (status != WGPURequestDeviceStatus_Success) {
-        set_gpu_error("Device request failed: %s", message ? message : "unknown");
+         char msg_buf[512] = {0};
+        size_t len = message.length == WGPU_STRLEN ? (message.data ? strlen(message.data) : 0) : message.length;
+        if (len > sizeof(msg_buf) - 1) len = sizeof(msg_buf) - 1;
+        if (message.data) memcpy(msg_buf, message.data, len);
+
+        set_gpu_error("Device request failed: %s", msg_buf);
+        *ctx->done = true;
         return;
     }
-    *(WGPUDevice *)userdata = device;
+    *(WGPUDevice *)ctx->output = device;
+    *ctx->done = true;
 }
 
 /* ============================================================================
@@ -113,7 +154,7 @@ static WGPUBindGroupLayout create_bind_group_layout(
     const char *label
 ) {
     WGPUBindGroupLayoutDescriptor desc = {
-        .label = label,
+        .label = wgpu_str(label),
         .entryCount = entry_count,
         .entries = entries,
     };
@@ -128,18 +169,18 @@ static WGPUComputePipeline create_compute_pipeline(
     const char *label
 ) {
     WGPUPipelineLayoutDescriptor layout_desc = {
-        .label = label,
+        .label = wgpu_str(label),
         .bindGroupLayoutCount = 1,
         .bindGroupLayouts = &layout,
     };
     WGPUPipelineLayout pipeline_layout = wgpuDeviceCreatePipelineLayout(device, &layout_desc);
 
     WGPUComputePipelineDescriptor desc = {
-        .label = label,
+        .label = wgpu_str(label),
         .layout = pipeline_layout,
         .compute = {
             .module = shader,
-            .entryPoint = entry_point,
+            .entryPoint = wgpu_str(entry_point),
         },
     };
 
@@ -156,7 +197,7 @@ static WGPUComputePipeline create_compute_pipeline(
 gemma3_gpu_buffer gemma3_gpu_create_buffer(
     gemma3_gpu_context *ctx,
     size_t size,
-    WGPUBufferUsageFlags usage
+    WGPUFlags usage
 ) {
     gemma3_gpu_buffer buf = {0};
 
@@ -183,12 +224,25 @@ void gemma3_gpu_write_buffer(
     wgpuQueueWriteBuffer(ctx->queue, buf->buffer, 0, data, size);
 }
 
+static void on_buffer_map(WGPUMapAsyncStatus status, WGPUStringView message, void *userdata, void *userdata2) {
+    (void)message; (void)userdata2;
+    // fprintf(stderr, "DEBUG: on_buffer_map called with status %d\n", status);
+    typedef struct {
+        bool done;
+        WGPUMapAsyncStatus status;
+    } MapContext;
+    MapContext *ctx = (MapContext *)userdata;
+    ctx->status = status;
+    ctx->done = true;
+}
+
 void gemma3_gpu_read_buffer(
     gemma3_gpu_context *ctx,
     gemma3_gpu_buffer *buf,
     void *data,
     size_t size
 ) {
+    // fprintf(stderr, "DEBUG: gemma3_gpu_read_buffer start\n");
     /* Create staging buffer for readback */
     WGPUBufferDescriptor staging_desc = {
         .size = size,
@@ -206,37 +260,51 @@ void gemma3_gpu_read_buffer(
     WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cmd_desc);
     wgpuQueueSubmit(ctx->queue, 1, &commands);
 
-    /* Wait for completion and map */
-    wgpuDevicePoll(ctx->device, true, NULL);
+    // fprintf(stderr, "."); // Heartbeat
+    // fprintf(stderr, "DEBUG: Copy command submitted\n");
 
     /* Map buffer */
     typedef struct {
         bool done;
-        WGPUBufferMapAsyncStatus status;
+        WGPUMapAsyncStatus status;
     } MapContext;
 
-    MapContext map_ctx = {false, WGPUBufferMapAsyncStatus_Unknown};
+    MapContext map_ctx = {false, WGPUMapAsyncStatus_Unknown};
 
-    wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, size,
-        (WGPUBufferMapCallback)[](WGPUBufferMapAsyncStatus status, void *userdata) {
-            MapContext *ctx = (MapContext *)userdata;
-            ctx->status = status;
-            ctx->done = true;
-        }, &map_ctx);
+    WGPUBufferMapCallbackInfo map_cb = {
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = on_buffer_map,
+        .userdata1 = &map_ctx,
+    };
 
+    wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, size, map_cb);
+    // fprintf(stderr, "DEBUG: MapAsync called, polling...\n");
+
+    // Initial check
+    wgpuInstanceProcessEvents(ctx->instance);
+
+    int poll_count = 0;
     while (!map_ctx.done) {
-        wgpuDevicePoll(ctx->device, true, NULL);
+        wgpuInstanceProcessEvents(ctx->instance);
+        poll_count++;
+        // if (poll_count % 1000000 == 0) {
+        //      fprintf(stderr, "DEBUG: Polling... (count=%d)\n", poll_count);
+        // }
     }
+    // fprintf(stderr, "DEBUG: Map done (status=%d)\n", map_ctx.status);
 
-    if (map_ctx.status == WGPUBufferMapAsyncStatus_Success) {
+    if (map_ctx.status == WGPUMapAsyncStatus_Success) {
         const void *mapped = wgpuBufferGetConstMappedRange(staging, 0, size);
         memcpy(data, mapped, size);
         wgpuBufferUnmap(staging);
+    } else {
+        fprintf(stderr, "Error: Failed to map buffer (status=%d)\n", map_ctx.status);
     }
 
     wgpuBufferRelease(staging);
     wgpuCommandBufferRelease(commands);
     wgpuCommandEncoderRelease(encoder);
+    // fprintf(stderr, "DEBUG: read_buffer end\n");
 }
 
 void gemma3_gpu_destroy_buffer(gemma3_gpu_buffer *buf) {
@@ -260,7 +328,20 @@ int gemma3_gpu_available(void) {
     return 1;
 }
 
+static void log_callback(WGPULogLevel level, WGPUStringView message, void *userdata) {
+    (void)level; (void)userdata;
+    if (message.length == WGPU_STRLEN) {
+        fprintf(stderr, "[WGPU] %s\n", message.data);
+    } else {
+        fprintf(stderr, "[WGPU] %.*s\n", (int)message.length, message.data);
+    }
+}
+
 gemma3_gpu_context *gemma3_gpu_init(void) {
+    /* Setup logging first */
+    wgpuSetLogCallback(log_callback, NULL);
+    wgpuSetLogLevel(WGPULogLevel_Info);
+
     gemma3_gpu_context *ctx = (gemma3_gpu_context *)calloc(1, sizeof(gemma3_gpu_context));
     if (!ctx) {
         set_gpu_error("Failed to allocate GPU context");
@@ -277,15 +358,24 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
     }
 
     /* Request adapter */
+    bool adapter_done = false;
+    RequestCtx adapter_ctx = { (void**)&ctx->adapter, &adapter_done };
+
     WGPURequestAdapterOptions adapter_opts = {
+        .nextInChain = NULL,
+        .featureLevel = WGPUFeatureLevel_Core,
         .powerPreference = WGPUPowerPreference_HighPerformance,
     };
-    wgpuInstanceRequestAdapter(ctx->instance, &adapter_opts, on_adapter_request, &ctx->adapter);
-
-    /* Poll for adapter */
-    while (!ctx->adapter) {
-        /* In native WebGPU, this is synchronous; in browser, need async handling */
-        break;
+    WGPURequestAdapterCallbackInfo adapter_cb_info = {
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = on_adapter_request,
+        .userdata1 = &adapter_ctx,
+    };
+    
+    wgpuInstanceRequestAdapter(ctx->instance, &adapter_opts, adapter_cb_info);
+    
+    while (!adapter_done) {
+        wgpuInstanceProcessEvents(ctx->instance);
     }
 
     if (!ctx->adapter) {
@@ -296,19 +386,60 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
     }
 
     /* Request device with required limits */
-    WGPURequiredLimits required_limits = {0};
-    required_limits.limits.maxStorageBufferBindingSize = 1024 * 1024 * 1024; /* 1GB */
-    required_limits.limits.maxBufferSize = 1024 * 1024 * 1024;
-    required_limits.limits.maxComputeWorkgroupSizeX = 256;
-    required_limits.limits.maxComputeWorkgroupSizeY = 256;
-    required_limits.limits.maxComputeWorkgroupSizeZ = 64;
-    required_limits.limits.maxComputeInvocationsPerWorkgroup = 256;
-    required_limits.limits.maxComputeWorkgroupsPerDimension = 65535;
+    /* Request device with required limits */
+    WGPULimits limits = {0};
+    if (wgpuAdapterGetLimits(ctx->adapter, &limits)) { // Check return value if possible, generally returns true/status on success
+         // In webgpu-native it returns bool or Status. Let's assume it populates limits.
+    } else {
+        // Fallback or just ignore if it's void return in some versions, but 
+        // the error log showed WGPUStatus return type.
+        // Let's just call it.
+    }
+    
+    // Re-check: explicit call without if usually works if we don't handle error
+    wgpuAdapterGetLimits(ctx->adapter, &limits);
+
+    /* Ensure we have at least some minimum capability or log warning */
+    if (limits.maxStorageBufferBindingSize < 128 * 1024 * 1024) {
+        fprintf(stderr, "Warning: maxStorageBufferBindingSize is small (%u bytes)\n", 
+            (unsigned int)limits.maxStorageBufferBindingSize);
+    }
+    
+    // We should probably rely on the limits returned.
+    // However, if getLimits failed (zeros), we might want defaults.
+    if (limits.maxComputeWorkgroupSizeX == 0) {
+        limits.maxStorageBufferBindingSize = 128 * 1024 * 1024;
+        limits.maxBufferSize = 128 * 1024 * 1024;
+        limits.maxComputeWorkgroupSizeX = 256;
+        limits.maxComputeWorkgroupSizeY = 256;
+        limits.maxComputeWorkgroupSizeZ = 64;
+        limits.maxComputeInvocationsPerWorkgroup = 256;
+        limits.maxComputeWorkgroupsPerDimension = 65535;
+    }
 
     WGPUDeviceDescriptor device_desc = {
-        .requiredLimits = &required_limits,
+        .label = wgpu_str("gemma3_device"),
+        .requiredLimits = &limits,
+        .uncapturedErrorCallbackInfo = {
+            .callback = on_device_error,
+            .userdata1 = ctx,
+        },
     };
-    wgpuAdapterRequestDevice(ctx->adapter, &device_desc, on_device_request, &ctx->device);
+    
+    bool device_done = false;
+    RequestCtx device_ctx = { (void**)&ctx->device, &device_done };
+
+    WGPURequestDeviceCallbackInfo device_cb_info = {
+        .mode = WGPUCallbackMode_AllowProcessEvents,
+        .callback = on_device_request,
+        .userdata1 = &device_ctx,
+    };
+    
+    wgpuAdapterRequestDevice(ctx->adapter, &device_desc, device_cb_info);
+    
+    while (!device_done) {
+        wgpuInstanceProcessEvents(ctx->instance);
+    }
 
     if (!ctx->device) {
         set_gpu_error("Failed to create GPU device");
@@ -317,9 +448,6 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
         free(ctx);
         return NULL;
     }
-
-    /* Set error callback */
-    wgpuDeviceSetUncapturedErrorCallback(ctx->device, on_device_error, ctx);
 
     /* Get queue */
     ctx->queue = wgpuDeviceGetQueue(ctx->device);
@@ -331,16 +459,17 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
     }
 
     /* Create shader module */
-    WGPUShaderModuleWGSLDescriptor wgsl_desc = {
+    WGPUShaderSourceWGSL wgsl_chain = {
         .chain = {
-            .sType = WGPUSType_ShaderModuleWGSLDescriptor,
+            .next = NULL,
+            .sType = WGPUSType_ShaderSourceWGSL,
         },
-        .code = shader_source,
+        .code = wgpu_str(shader_source),
     };
 
     WGPUShaderModuleDescriptor shader_desc = {
-        .nextInChain = (WGPUChainedStruct *)&wgsl_desc,
-        .label = "gemma3_kernels",
+        .nextInChain = (const WGPUChainedStruct *)&wgsl_chain,
+        .label = wgpu_str("gemma3_kernels"),
     };
 
     ctx->shader_module = wgpuDeviceCreateShaderModule(ctx->device, &shader_desc);
@@ -492,6 +621,14 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
     ctx->workgroup_size_2d_y = 16;
 
     fprintf(stderr, "WebGPU initialized successfully\n");
+
+    WGPUAdapterInfo info = {0};
+    wgpuAdapterGetInfo(ctx->adapter, &info);
+    fprintf(stderr, "Adapter: %.*s\n", (int)info.device.length, info.device.data);
+    fprintf(stderr, "Backend: %d\n", info.backendType);
+    fprintf(stderr, "Driver: %.*s\n", (int)info.description.length, info.description.data);
+    wgpuAdapterInfoFreeMembers(info);
+
     return ctx;
 }
 
@@ -513,7 +650,7 @@ int gemma3_gpu_init_buffers(
     ctx->head_dim = head_dim;
     ctx->max_context = max_context;
 
-    WGPUBufferUsageFlags storage_rw = WGPUBufferUsage_Storage |
+    WGPUFlags storage_rw = WGPUBufferUsage_Storage |
                                        WGPUBufferUsage_CopyDst |
                                        WGPUBufferUsage_CopySrc;
 
@@ -605,7 +742,7 @@ void gemma3_gpu_free(gemma3_gpu_context *ctx) {
  * ========================================================================== */
 
 void gemma3_gpu_sync(gemma3_gpu_context *ctx) {
-    wgpuDevicePoll(ctx->device, true, NULL);
+    wgpuInstanceProcessEvents(ctx->instance);
     ctx->pending_commands = 0;
 }
 
@@ -1141,13 +1278,17 @@ const char *gemma3_gpu_device_name(gemma3_gpu_context *ctx) {
     if (!ctx || !ctx->adapter) return "Unknown";
 
     static char name[256];
-    WGPUAdapterProperties props = {0};
-    wgpuAdapterGetProperties(ctx->adapter, &props);
+    WGPUAdapterInfo info = {0};
+    wgpuAdapterGetInfo(ctx->adapter, &info);
 
-    snprintf(name, sizeof(name), "%s (%s)",
-             props.name ? props.name : "Unknown",
-             props.driverDescription ? props.driverDescription : "Unknown driver");
+    int len_vendor = info.vendor.length == WGPU_STRLEN ? (info.vendor.data ? strlen(info.vendor.data) : 0) : info.vendor.length;
+    int len_device = info.device.length == WGPU_STRLEN ? (info.device.data ? strlen(info.device.data) : 0) : info.device.length;
 
+    snprintf(name, sizeof(name), "%.*s (%.*s)",
+             len_device, info.device.data ? info.device.data : "Unknown",
+             len_vendor, info.vendor.data ? info.vendor.data : "Unknown");
+    
+    wgpuAdapterInfoFreeMembers(info);
     return name;
 }
 

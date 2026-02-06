@@ -28,7 +28,7 @@
 typedef struct {
     WGPUBuffer buffer;
     size_t size;
-    WGPUBufferUsageFlags usage;
+    WGPUFlags usage;
 } gemma3_gpu_buffer;
 
 /**
@@ -216,7 +216,7 @@ void gemma3_gpu_free(gemma3_gpu_context *ctx);
  */
 gemma3_gpu_buffer gemma3_gpu_create_buffer(gemma3_gpu_context *ctx,
                                             size_t size,
-                                            WGPUBufferUsageFlags usage);
+                                            WGPUFlags usage);
 
 /**
  * Upload data to GPU buffer
