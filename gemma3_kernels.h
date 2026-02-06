@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #ifdef USE_BLAS
 #include <cblas.h>
@@ -272,8 +273,12 @@ void gemma3_f32_to_bf16(uint16_t *bf16, const float *f32, int n);
 static inline float gemma3_bf16_to_f32_single(uint16_t bf16) {
     uint32_t bits = ((uint32_t)bf16) << 16;
     float result;
-    // Use memcpy for type-punning to avoid strict aliasing issues
+    /* Use memcpy for type-punning to avoid strict aliasing issues */
+#if defined(_MSC_VER)
+    memcpy(&result, &bits, sizeof(result));
+#else
     __builtin_memcpy(&result, &bits, sizeof(result));
+#endif
     return result;
 }
 
@@ -282,7 +287,11 @@ static inline float gemma3_bf16_to_f32_single(uint16_t bf16) {
  */
 static inline uint16_t gemma3_f32_to_bf16_single(float f32) {
     uint32_t bits;
+#if defined(_MSC_VER)
+    memcpy(&bits, &f32, sizeof(bits));
+#else
     __builtin_memcpy(&bits, &f32, sizeof(bits));
+#endif
     return (uint16_t)(bits >> 16);
 }
 

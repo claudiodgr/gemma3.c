@@ -3,19 +3,16 @@
  *
  * Parses SafeTensors format and provides efficient access to model weights.
  * Supports split files (model-00001-of-00002.safetensors, etc.)
+ * Cross-platform: uses gemma3_platform.h for mmap/directory abstractions.
  */
 
 #include "gemma3.h"
 #include "gemma3_kernels.h"
+#include "gemma3_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <dirent.h>
 
 /* ============================================================================
  * SafeTensors Data Types
@@ -30,7 +27,14 @@ typedef enum {
     ST_DTYPE_UNKNOWN = -1
 } st_dtype;
 
-__attribute__((unused))
+/* Attribute for unused function - cross-platform */
+#if defined(_MSC_VER)
+#define ST_UNUSED
+#else
+#define ST_UNUSED __attribute__((unused))
+#endif
+
+ST_UNUSED
 static int st_dtype_size(st_dtype dtype) {
     switch (dtype) {
         case ST_DTYPE_F32: return 4;
@@ -75,11 +79,10 @@ typedef struct {
 #define ST_MAX_TENSORS 1024
 
 typedef struct {
-    int fd;
-    size_t file_size;
-    void *mmap_ptr;
-    size_t header_size;
-    char *data_start;
+    void *mmap_ptr;       /* Memory-mapped file pointer */
+    size_t file_size;     /* Size of the mapped file */
+    size_t header_size;   /* Size of JSON header */
+    char *data_start;     /* Pointer to data section (after header) */
 } st_file;
 
 typedef struct {
@@ -346,44 +349,32 @@ static int st_parse_header(const char *json_str, int json_len,
  * ========================================================================== */
 
 static int st_open_file(st_file *f, const char *path) {
-    f->fd = open(path, O_RDONLY);
-    if (f->fd < 0) {
+    /* Use cross-platform memory mapping */
+    f->mmap_ptr = gemma3_mmap_file(path, &f->file_size);
+    if (!f->mmap_ptr) {
         return 0;
     }
 
-    struct stat st;
-    if (fstat(f->fd, &st) < 0) {
-        close(f->fd);
-        return 0;
-    }
-    f->file_size = st.st_size;
+    /* Advise OS for sequential access */
+    gemma3_madvise(f->mmap_ptr, f->file_size, 1);
 
-    f->mmap_ptr = mmap(NULL, f->file_size, PROT_READ, MAP_PRIVATE, f->fd, 0);
-    if (f->mmap_ptr == MAP_FAILED) {
-        close(f->fd);
-        return 0;
-    }
-
-    // Parse header size (first 8 bytes as little-endian uint64)
+    /* Parse header size (first 8 bytes as little-endian uint64) */
     uint64_t header_size;
     memcpy(&header_size, f->mmap_ptr, 8);
-    f->header_size = header_size;
+    f->header_size = (size_t)header_size;
 
-    // Data starts after 8-byte length + header
+    /* Data starts after 8-byte length + header */
     f->data_start = (char *)f->mmap_ptr + 8 + f->header_size;
 
     return 1;
 }
 
 static void st_close_file(st_file *f) {
-    if (f->mmap_ptr && f->mmap_ptr != MAP_FAILED) {
-        munmap(f->mmap_ptr, f->file_size);
-    }
-    if (f->fd >= 0) {
-        close(f->fd);
+    if (f->mmap_ptr) {
+        gemma3_munmap_file(f->mmap_ptr, f->file_size);
     }
     f->mmap_ptr = NULL;
-    f->fd = -1;
+    f->file_size = 0;
 }
 
 /* ============================================================================
@@ -396,30 +387,30 @@ st_context *st_load(const char *model_dir) {
 
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
 
-    // Find all safetensors files
+    /* Find all safetensors files using cross-platform directory iteration */
     char file_paths[16][1024];
     int num_files = 0;
 
-    DIR *dir = opendir(model_dir);
+    gemma3_dir *dir = gemma3_opendir(model_dir);
     if (!dir) {
         free(ctx);
         return NULL;
     }
 
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL && num_files < 16) {
-        // Check if filename ends with .safetensors (not just contains it)
-        size_t name_len = strlen(entry->d_name);
+    gemma3_dirent entry;
+    while (gemma3_readdir(dir, &entry) > 0 && num_files < 16) {
+        /* Check if filename ends with .safetensors */
+        size_t name_len = strlen(entry.name);
         const char *suffix = ".safetensors";
         size_t suffix_len = strlen(suffix);
         if (name_len > suffix_len &&
-            strcmp(entry->d_name + name_len - suffix_len, suffix) == 0) {
-            snprintf(file_paths[num_files], sizeof(file_paths[num_files]),
-                     "%s/%s", model_dir, entry->d_name);
+            strcmp(entry.name + name_len - suffix_len, suffix) == 0) {
+            gemma3_path_join(model_dir, entry.name,
+                            file_paths[num_files], sizeof(file_paths[num_files]));
             num_files++;
         }
     }
-    closedir(dir);
+    gemma3_closedir(dir);
 
     if (num_files == 0) {
         free(ctx);

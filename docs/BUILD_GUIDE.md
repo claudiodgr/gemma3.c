@@ -6,12 +6,13 @@ Complete guide for building, configuring, and installing gemma3.c.
 
 1. [Prerequisites](#prerequisites)
 2. [Quick Start](#quick-start)
-3. [Build Targets](#build-targets)
-4. [Build Configuration](#build-configuration)
-5. [Platform-Specific Instructions](#platform-specific-instructions)
-6. [Model Download](#model-download)
-7. [Verification](#verification)
-8. [Troubleshooting](#troubleshooting)
+3. [Build Systems](#build-systems)
+4. [CMake Build (Recommended)](#cmake-build-recommended)
+5. [Makefile Build (Legacy)](#makefile-build-legacy)
+6. [Platform-Specific Instructions](#platform-specific-instructions)
+7. [Model Download](#model-download)
+8. [Verification](#verification)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -21,16 +22,16 @@ Complete guide for building, configuring, and installing gemma3.c.
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| GCC or Clang | 7+ / 6+ | C11 compiler |
-| GNU Make | 3.8+ | Build system |
+| C Compiler | GCC 7+, Clang 6+, or MSVC 2019+ | C11 compiler |
+| CMake | 3.16+ | Build system (recommended) |
 | Python 3 | 3.7+ | Model download script |
 
 ### Optional Dependencies
 
 | Dependency | Purpose | Installation |
 |------------|---------|--------------|
-| OpenBLAS | BLAS acceleration | `apt install libopenblas-dev` |
-| pthreads | Multi-threading | Usually included with libc |
+| OpenBLAS | BLAS acceleration | See platform-specific section |
+| wgpu-native | WebGPU GPU acceleration | See [WebGPU Setup](#webgpu-setup) |
 | huggingface_hub | Model download | `pip install huggingface_hub` |
 
 ### Disk Space Requirements
@@ -54,26 +55,142 @@ Complete guide for building, configuring, and installing gemma3.c.
 
 ## Quick Start
 
+### CMake (Recommended - Cross-Platform)
+
 ```bash
-# 1. Clone repository
-git clone https://github.com/your-repo/gemma3.c.git
-cd gemma3.c
+# Configure and build
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 
-# 2. Build
+# Or use presets
+cmake --preset release
+cmake --build --preset release
+
+# Run
+./build/gemma3 -m ./gemma-3-4b-it -p "Hello, world!"
+```
+
+### Makefile (Linux/macOS)
+
+```bash
 make
-
-# 3. Download model (requires HuggingFace token)
-export HF_TOKEN=your_token_here
-pip install huggingface_hub
-python download_model.py
-
-# 4. Run
 ./gemma3 -m ./gemma-3-4b-it -p "Hello, world!"
 ```
 
 ---
 
-## Build Targets
+## Build Systems
+
+gemma3.c supports two build systems:
+
+| Build System | Platforms | Recommended For |
+|--------------|-----------|-----------------|
+| **CMake** | Linux, Windows, macOS | Cross-platform development, IDE integration |
+| **Makefile** | Linux, macOS | Quick builds on POSIX systems |
+
+---
+
+## CMake Build (Recommended)
+
+### Basic Usage
+
+```bash
+# Configure
+cmake -B build
+
+# Build
+cmake --build build
+
+# Install (optional)
+cmake --install build --prefix /usr/local
+```
+
+### Build Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `CMAKE_BUILD_TYPE` | Release | Build type (Debug, Release, RelWithDebInfo) |
+| `GEMMA3_USE_THREADS` | OFF | Enable multi-threading support |
+| `GEMMA3_USE_BLAS` | OFF | Enable OpenBLAS acceleration |
+| `GEMMA3_USE_WEBGPU` | OFF | Enable WebGPU GPU acceleration |
+| `GEMMA3_NATIVE` | OFF | Enable native CPU optimizations |
+| `GEMMA3_BUILD_SHARED` | OFF | Build shared library instead of static |
+| `GEMMA3_BUILD_CLI` | ON | Build command-line interface |
+
+### Example Configurations
+
+```bash
+# Debug build
+cmake -B build -DCMAKE_BUILD_TYPE=Debug
+
+# Release with threading
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGEMMA3_USE_THREADS=ON
+
+# Full optimization with BLAS and threading
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+    -DGEMMA3_NATIVE=ON \
+    -DGEMMA3_USE_BLAS=ON \
+    -DGEMMA3_USE_THREADS=ON
+
+# WebGPU GPU acceleration
+cmake -B build -DGEMMA3_USE_WEBGPU=ON
+```
+
+### CMake Presets
+
+Use presets for convenient configuration:
+
+```bash
+# List available presets
+cmake --list-presets
+
+# Configure with a preset
+cmake --preset release
+cmake --preset threads
+cmake --preset blas-threads
+cmake --preset webgpu
+cmake --preset full
+
+# Build with a preset
+cmake --build --preset release
+```
+
+### Visual Studio (Windows)
+
+```powershell
+# Generate Visual Studio solution
+cmake -B build -G "Visual Studio 17 2022" -A x64
+
+# Build from command line
+cmake --build build --config Release
+
+# Or open build/gemma3.sln in Visual Studio
+```
+
+### Xcode (macOS)
+
+```bash
+# Generate Xcode project
+cmake -B build -G Xcode
+
+# Build from command line
+cmake --build build --config Release
+
+# Or open build/gemma3.xcodeproj in Xcode
+```
+
+### Ninja (Faster Builds)
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+---
+
+## Makefile Build (Legacy)
+
+For POSIX systems (Linux, macOS) with Make installed.
 
 ### Available Targets
 
@@ -84,141 +201,11 @@ python download_model.py
 | Fast | `make fast` | Native CPU optimizations |
 | Threads | `make threads` | Multi-threaded inference |
 | BLAS | `make blas` | OpenBLAS acceleration |
-| BLAS+Threads | `make blas-threads` | Best performance |
+| BLAS+Threads | `make blas-threads` | Best CPU performance |
+| WebGPU | `make webgpu` | GPU acceleration |
+| WebGPU+Threads | `make webgpu-threads` | GPU + CPU threading |
 | Clean | `make clean` | Remove build artifacts |
 | Help | `make help` | Show available targets |
-
-### Target Details
-
-#### Release Build (Default)
-
-```bash
-make
-```
-
-**Flags:** `-O3 -DNDEBUG`
-
-Standard optimized build suitable for most use cases.
-
-#### Debug Build
-
-```bash
-make debug
-```
-
-**Flags:** `-g -O0 -DDEBUG`
-
-Includes debug symbols for gdb/lldb. No optimization for accurate debugging.
-
-#### Fast Build
-
-```bash
-make fast
-```
-
-**Flags:** `-O3 -march=native -ffast-math -DNDEBUG`
-
-Uses CPU-specific optimizations. Binary may not work on other machines.
-
-#### Threaded Build
-
-```bash
-make threads
-```
-
-**Flags:** `-DUSE_THREADS`
-**Libs:** `-lpthread`
-**Additional source:** `gemma3_threads.c`
-
-Enables multi-core parallelization of matrix operations.
-
-#### BLAS Build
-
-```bash
-make blas
-```
-
-**Flags:** `-DUSE_BLAS`
-**Libs:** `-lopenblas`
-
-Uses OpenBLAS for optimized BLAS routines (sgemm, sgemv, sdot).
-
-#### BLAS + Threads Build
-
-```bash
-make blas-threads
-```
-
-**Flags:** `-DUSE_BLAS -DUSE_THREADS`
-**Libs:** `-lopenblas -lpthread`
-
-Combines OpenBLAS with thread pool for maximum performance.
-
----
-
-## Build Configuration
-
-### Compiler Selection
-
-```bash
-# Use GCC (default)
-make CC=gcc
-
-# Use Clang
-make CC=clang
-```
-
-### Custom Flags
-
-The Makefile uses these flag categories:
-
-```makefile
-CFLAGS_BASE    = -Wall -Wextra -Wpedantic -std=c11 -MMD -MP
-CFLAGS_RELEASE = -O3 -DNDEBUG
-CFLAGS_DEBUG   = -g -O0 -DDEBUG
-CFLAGS_FAST    = -O3 -march=native -ffast-math -DNDEBUG
-
-LDFLAGS_BASE   = -lm
-```
-
-### Build Directory Structure
-
-```
-build/
-├── release/          # make
-│   ├── gemma3.o
-│   ├── main.o
-│   └── ...
-├── debug/            # make debug
-│   └── ...
-├── fast/             # make fast
-│   └── ...
-├── threads/          # make threads
-│   └── ...
-├── blas/             # make blas
-│   └── ...
-└── blas-threads/     # make blas-threads
-    └── ...
-```
-
-### Preprocessor Defines
-
-| Define | Effect |
-|--------|--------|
-| `NDEBUG` | Disables assert() |
-| `DEBUG` | Enables debug logging |
-| `USE_BLAS` | Enables OpenBLAS routines |
-| `USE_THREADS` | Enables thread pool |
-
-### Compiler Auto-Detection
-
-The code automatically detects certain CPU features:
-
-```c
-#ifdef __AVX2__
-// AVX2 SIMD optimizations enabled
-#endif
-```
 
 ---
 
@@ -229,39 +216,32 @@ The code automatically detects certain CPU features:
 ```bash
 # Install build tools
 sudo apt update
-sudo apt install build-essential
+sudo apt install build-essential cmake
 
-# Install optional dependencies
-sudo apt install libopenblas-dev  # For BLAS support
+# Optional: OpenBLAS
+sudo apt install libopenblas-dev
 
-# Build
-make blas-threads
+# Optional: Vulkan (for WebGPU)
+sudo apt install libvulkan-dev vulkan-tools
+
+# Build with CMake
+cmake -B build -DGEMMA3_USE_THREADS=ON -DGEMMA3_USE_BLAS=ON
+cmake --build build
 ```
 
 ### Linux (Fedora/RHEL)
 
 ```bash
 # Install build tools
-sudo dnf install gcc make
+sudo dnf groupinstall "Development Tools"
+sudo dnf install cmake
 
-# Install optional dependencies
+# Optional: OpenBLAS
 sudo dnf install openblas-devel
 
 # Build
-make blas-threads
-```
-
-### Linux (Arch)
-
-```bash
-# Install build tools
-sudo pacman -S base-devel
-
-# Install optional dependencies
-sudo pacman -S openblas
-
-# Build
-make blas-threads
+cmake -B build -DGEMMA3_USE_THREADS=ON -DGEMMA3_USE_BLAS=ON
+cmake --build build
 ```
 
 ### macOS
@@ -270,355 +250,234 @@ make blas-threads
 # Install Xcode command line tools
 xcode-select --install
 
-# Install Homebrew (if not installed)
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+# Install CMake (via Homebrew)
+brew install cmake
 
-# Install optional dependencies
+# Optional: OpenBLAS
 brew install openblas
 
-# Build (note: may need to specify OpenBLAS path)
-LDFLAGS="-L/opt/homebrew/opt/openblas/lib" \
-CFLAGS="-I/opt/homebrew/opt/openblas/include" \
-make blas-threads
+# Build (specify OpenBLAS path if needed)
+cmake -B build \
+    -DGEMMA3_USE_THREADS=ON \
+    -DGEMMA3_USE_BLAS=ON \
+    -DOpenBLAS_ROOT=/opt/homebrew/opt/openblas
+cmake --build build
+```
+
+### Windows (Visual Studio)
+
+```powershell
+# Install Visual Studio 2019 or later with C++ workload
+# Install CMake (download from cmake.org or use winget)
+winget install Kitware.CMake
+
+# Configure
+cmake -B build -G "Visual Studio 17 2022" -A x64
+
+# Build
+cmake --build build --config Release
+
+# Or open build\gemma3.sln in Visual Studio
+```
+
+### Windows (MinGW-w64)
+
+```bash
+# Install MSYS2 from https://www.msys2.org/
+# In MSYS2 terminal:
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake
+
+# Build
+cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
 
 ### Windows (WSL)
 
-Windows Subsystem for Linux is the recommended approach:
-
 ```bash
-# Install WSL (in PowerShell as Administrator)
-wsl --install
-
-# Inside Ubuntu WSL:
+# Inside WSL (Ubuntu)
 sudo apt update
-sudo apt install build-essential libopenblas-dev
+sudo apt install build-essential cmake
 
-# Build
-make blas-threads
+# Follow Linux instructions
+cmake -B build -DGEMMA3_USE_THREADS=ON
+cmake --build build
 ```
 
-### Windows (MinGW)
+---
 
-MinGW builds work but have limitations (no mmap):
+## WebGPU Setup
+
+### Download wgpu-native Libraries
+
+**Automatic download:**
+```bash
+# Linux/macOS
+./scripts/download_webgpu.sh
+
+# Windows (PowerShell)
+.\scripts\download_webgpu.ps1
+```
+
+**Manual download:**
+1. Go to https://github.com/gfx-rs/wgpu-native/releases
+2. Download the appropriate archive for your platform
+3. Extract to `lib/webgpu/<platform>/`
+
+See `lib/webgpu/README.md` for detailed instructions.
+
+### Build with WebGPU
 
 ```bash
-# Install MSYS2 from https://www.msys2.org/
-
-# In MSYS2 terminal:
-pacman -S mingw-w64-x86_64-gcc make
-
-# Build (limited functionality)
-make
+cmake -B build -DGEMMA3_USE_WEBGPU=ON
+cmake --build build
 ```
 
-**Note:** MinGW builds don't support memory mapping. The SafeTensors loader will use a fallback that loads entire files into memory.
+### GPU Driver Requirements
+
+- **Linux**: Vulkan drivers (Mesa, NVIDIA, AMD)
+- **Windows**: Direct3D 12 or Vulkan drivers
+- **macOS**: Metal (built into macOS 10.14+)
 
 ---
 
 ## Model Download
 
-### Using the Download Script
+### Using download_model.py
 
 ```bash
-# Set your HuggingFace token
-export HF_TOKEN=your_token_here
+# Set HuggingFace token
+export HF_TOKEN=your_token_here  # Linux/macOS
+$env:HF_TOKEN = "your_token_here"  # Windows PowerShell
 
-# Install required Python package
+# Install huggingface_hub
 pip install huggingface_hub
 
 # Download model
 python download_model.py
+
+# Model files will be in ./gemma-3-4b-it/
 ```
 
-### Script Options
+### Required Files
 
-```bash
-python download_model.py --help
-
-Options:
-  --token TOKEN      HuggingFace API token
-  --repo REPO        Model repository (default: google/gemma-3-4b-it)
-  --output DIR       Output directory (default: ./gemma-3-4b-it)
-```
-
-### Manual Download
-
-Alternatively, use the HuggingFace CLI:
-
-```bash
-# Install CLI
-pip install huggingface-cli
-
-# Login
-huggingface-cli login
-
-# Download
-huggingface-cli download google/gemma-3-4b-it --local-dir ./gemma-3-4b-it
-```
-
-### Required Model Files
-
-After download, verify these files exist:
-
-```
-gemma-3-4b-it/
-├── model-00001-of-00002.safetensors  # ~4 GB
-├── model-00002-of-00002.safetensors  # ~4 GB
-├── tokenizer.model                    # ~4 MB
-├── config.json                        # Model config
-└── tokenizer_config.json              # Tokenizer config
-```
+| File | Size | Description |
+|------|------|-------------|
+| `model-00001-of-00002.safetensors` | ~4 GB | Model weights part 1 |
+| `model-00002-of-00002.safetensors` | ~4 GB | Model weights part 2 |
+| `tokenizer.model` | ~4 MB | SentencePiece tokenizer |
 
 ---
 
 ## Verification
 
-### Build Verification
+### Check Build
 
 ```bash
-# Check binary exists
-ls -la gemma3
+# Show version/help
+./build/gemma3 --help
 
-# Check version
-./gemma3 --help
+# Test with a simple prompt
+./build/gemma3 -m ./gemma-3-4b-it -p "What is 2+2?" -n 50
 ```
 
-### Quick Test
+### Check GPU (WebGPU build)
 
 ```bash
-# Simple generation test
-./gemma3 -m ./gemma-3-4b-it -p "2+2=" -n 10
-# Expected: "4" or similar
-
-# Verbose mode
-./gemma3 -m ./gemma-3-4b-it -p "Hello" -n 5 -v
-```
-
-### Tokenization Test
-
-```bash
-# Test tokenizer
-./gemma3 -m ./gemma-3-4b-it -p "Hello, world!" --tokenize
-# Shows token IDs
-```
-
-### Performance Test
-
-```bash
-# Time a generation
-time ./gemma3 -m ./gemma-3-4b-it -p "Explain quantum computing" -n 100
-
-# Compare build modes
-make clean && make && time ./gemma3 -m ./gemma-3-4b-it -p "Test" -n 50
-make clean && make blas-threads && time ./gemma3 -m ./gemma-3-4b-it -p "Test" -n 50
+# The binary will report GPU detection on startup
+./build/gemma3 -m ./gemma-3-4b-it -p "Hello" -v
 ```
 
 ---
 
 ## Troubleshooting
 
-### Compilation Errors
+### CMake Errors
 
-#### "stdio.h not found"
-
-Install development headers:
+**"Could not find OpenBLAS"**
 ```bash
-# Ubuntu/Debian
-sudo apt install libc6-dev
-
-# Fedora
-sudo dnf install glibc-devel
-```
-
-#### "cblas.h not found"
-
-Install OpenBLAS development files:
-```bash
-# Ubuntu/Debian
+# Linux
 sudo apt install libopenblas-dev
-
-# Fedora
-sudo dnf install openblas-devel
 
 # macOS
 brew install openblas
+cmake -B build -DOpenBLAS_ROOT=/opt/homebrew/opt/openblas
+
+# Windows: Download OpenBLAS and set path
+cmake -B build -DOpenBLAS_ROOT=C:/OpenBLAS
 ```
 
-#### "pthread.h not found"
-
-pthreads should be included with libc. Try:
+**"Could not find WebGPU"**
 ```bash
-make threads LDFLAGS="-lpthread"
-```
+# Download wgpu-native libraries first
+./scripts/download_webgpu.sh  # or .ps1 on Windows
 
-### Linker Errors
-
-#### "undefined reference to cblas_sgemv"
-
-OpenBLAS not linked properly:
-```bash
-make blas LDFLAGS="-L/path/to/openblas/lib -lopenblas"
-```
-
-#### "undefined reference to sqrt"
-
-Math library not linked:
-```bash
-make LDFLAGS="-lm"
+# Or specify path manually
+cmake -B build -DWEBGPU_DIR=/path/to/wgpu
 ```
 
 ### Runtime Errors
 
-#### "Failed to load model"
+**"Failed to load model"**
+- Ensure all `.safetensors` files are present
+- Check file permissions
+- Verify the model path is correct
 
-Check model directory structure:
-```bash
-ls -la ./gemma-3-4b-it/
-# Should show .safetensors files and tokenizer.model
-```
+**"Out of memory"**
+- Reduce context size: `./gemma3 -m model -c 512`
+- Use a machine with more RAM
+- Check for memory leaks with valgrind
 
-#### "mmap failed"
-
-Not enough address space or permissions:
-```bash
-# Check available memory
-free -h
-
-# Try with reduced context
-./gemma3 -m ./gemma-3-4b-it -c 512 -p "Hello"
-```
-
-#### "Segmentation fault"
-
-Often memory-related:
-```bash
-# Run with debug build
-make debug
-gdb ./gemma3
-(gdb) run -m ./gemma-3-4b-it -p "Hello"
-(gdb) bt  # Show backtrace
-```
+**"mmap failed"**
+- Insufficient virtual address space
+- Try reducing context size
+- On 32-bit systems, use smaller models
 
 ### Performance Issues
 
-#### Slow generation
-
-Try optimized builds:
+**Slow inference**
 ```bash
-# Best performance
-make blas-threads
+# Use optimized build
+cmake -B build -DGEMMA3_NATIVE=ON -DGEMMA3_USE_THREADS=ON -DGEMMA3_USE_BLAS=ON
+cmake --build build
 
-# Or native optimizations
-make fast
+# Or use WebGPU for GPU acceleration
+cmake -B build -DGEMMA3_USE_WEBGPU=ON
 ```
 
-#### High memory usage
+### Build Performance
 
-Reduce context size:
+**Slow compilation**
 ```bash
-./gemma3 -m ./gemma-3-4b-it -c 1024 -p "Hello"
-```
+# Use Ninja for faster builds
+cmake -B build -G Ninja
+cmake --build build
 
-### Build System Issues
-
-#### "Nothing to be done"
-
-Force rebuild:
-```bash
-make clean
-make
-```
-
-#### Wrong build mode
-
-Check the binary was built with expected flags:
-```bash
-# Rebuild from scratch
-rm -rf build gemma3
-make blas-threads
+# Use parallel compilation
+cmake --build build -j$(nproc)  # Linux
+cmake --build build -j$(sysctl -n hw.ncpu)  # macOS
 ```
 
 ---
 
-## Advanced Configuration
+## IDE Integration
 
-### Custom OpenBLAS Location
+### VS Code
 
-```bash
-# macOS with Homebrew
-export OPENBLAS_DIR=/opt/homebrew/opt/openblas
-make blas CFLAGS="-I$OPENBLAS_DIR/include" LDFLAGS="-L$OPENBLAS_DIR/lib -lopenblas"
-```
+Install the CMake Tools extension, then:
+1. Open the project folder
+2. Press Ctrl+Shift+P → "CMake: Configure"
+3. Select a preset or configure manually
+4. Press Ctrl+Shift+P → "CMake: Build"
 
-### Static Linking
+### CLion
 
-For portable binaries:
-```bash
-make LDFLAGS="-static -lm"
-# Note: May need static versions of libraries
-```
+1. Open the project folder (CMakeLists.txt will be detected)
+2. Configure CMake options in Settings → Build → CMake
+3. Build with Ctrl+F9
 
-### Cross-Compilation
+### Visual Studio
 
-Example for ARM64:
-```bash
-make CC=aarch64-linux-gnu-gcc
-```
-
-### Sanitizers (Development)
-
-```bash
-# Address sanitizer
-make debug CFLAGS="-fsanitize=address -g"
-
-# Undefined behavior sanitizer
-make debug CFLAGS="-fsanitize=undefined -g"
-```
-
----
-
-## Makefile Reference
-
-### Complete Makefile Structure
-
-```makefile
-# Configuration
-CC ?= gcc
-TARGET ?= gemma3
-BUILD_DIR ?= build
-
-# Source files
-SRCS_BASE = gemma3.c gemma3_kernels.c gemma3_safetensors.c \
-            gemma3_tokenizer.c gemma3_transformer.c main.c
-
-# Flag presets
-CFLAGS_BASE    = -Wall -Wextra -Wpedantic -std=c11 -MMD -MP
-CFLAGS_RELEASE = -O3 -DNDEBUG
-CFLAGS_DEBUG   = -g -O0 -DDEBUG
-CFLAGS_FAST    = -O3 -march=native -ffast-math -DNDEBUG
-
-LDFLAGS_BASE   = -lm
-
-# Mode-specific configuration
-MODE ?= release
-# ... (see full Makefile for details)
-
-# Targets
-all: release
-debug: ...
-fast: ...
-blas: ...
-threads: ...
-blas-threads: ...
-clean: ...
-```
-
----
-
-## Related Documentation
-
-- [DOCUMENTATION.md](DOCUMENTATION.md) - Main project documentation
-- [ARCHITECTURE.md](ARCHITECTURE.md) - Architecture deep dive
-- [API_REFERENCE.md](API_REFERENCE.md) - Complete API reference
-- [INTERNALS.md](INTERNALS.md) - Implementation deep dive
+1. Open the folder or generated .sln file
+2. Select configuration (Debug/Release)
+3. Build with Ctrl+Shift+B

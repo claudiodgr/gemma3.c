@@ -537,7 +537,11 @@ static void bf16_matrix_to_f32(float *dst, const uint16_t *src, int rows, int co
     int n = rows * cols;
     for (int i = 0; i < n; i++) {
         uint32_t bits = ((uint32_t)src[i]) << 16;
+#if defined(_MSC_VER)
+        memcpy(&dst[i], &bits, sizeof(float));
+#else
         __builtin_memcpy(&dst[i], &bits, sizeof(float));
+#endif
     }
 }
 
@@ -859,6 +863,9 @@ typedef struct gemma3_transformer {
 #ifdef USE_THREADS
     gemma3_thread_pool *thread_pool;
 #endif
+#ifdef USE_WEBGPU
+    gemma3_gpu_context *gpu_ctx;
+#endif
 } gemma3_transformer;
 
 gemma3_transformer *gemma3_transformer_create(
@@ -904,11 +911,31 @@ gemma3_transformer *gemma3_transformer_create(
     t->thread_pool = gemma3_thread_pool_create(0); /* 0 = auto-detect CPU count */
 #endif
 
+#ifdef USE_WEBGPU
+    t->gpu_ctx = gemma3_gpu_init();
+    if (t->gpu_ctx) {
+        gemma3_gpu_init_buffers(t->gpu_ctx,
+                                cfg->hidden_size,
+                                cfg->intermediate_size,
+                                cfg->vocab_size,
+                                cfg->num_heads,
+                                cfg->num_kv_heads,
+                                cfg->head_dim,
+                                max_context);
+        fprintf(stderr, "WebGPU: Initialized (%s)\n", gemma3_gpu_device_name(t->gpu_ctx));
+    } else {
+        fprintf(stderr, "WebGPU: Not available, falling back to CPU\n");
+    }
+#endif
+
     return t;
 }
 
 void gemma3_transformer_destroy(gemma3_transformer *t) {
     if (!t) return;
+#ifdef USE_WEBGPU
+    if (t->gpu_ctx) gemma3_gpu_free(t->gpu_ctx);
+#endif
 #ifdef USE_THREADS
     gemma3_thread_pool_destroy(t->thread_pool);
 #endif
@@ -926,8 +953,11 @@ int gemma3_transformer_forward_token(
     float *logits
 ) {
     void *pool = NULL;
+#ifdef USE_WEBGPU
+    if (t->gpu_ctx) pool = t->gpu_ctx;  /* WebGPU takes priority */
+#endif
 #ifdef USE_THREADS
-    pool = t->thread_pool;
+    if (!pool) pool = t->thread_pool;   /* Fall back to CPU threads */
 #endif
     return gemma3_transformer_forward(
         logits, token_id, pos,
@@ -944,8 +974,11 @@ int gemma3_transformer_prefill_tokens(
     float *logits
 ) {
     void *pool = NULL;
+#ifdef USE_WEBGPU
+    if (t->gpu_ctx) pool = t->gpu_ctx;  /* WebGPU takes priority */
+#endif
 #ifdef USE_THREADS
-    pool = t->thread_pool;
+    if (!pool) pool = t->thread_pool;   /* Fall back to CPU threads */
 #endif
     return gemma3_transformer_prefill(
         logits, tokens, num_tokens, start_pos,

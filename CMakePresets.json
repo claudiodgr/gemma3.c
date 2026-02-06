@@ -1,0 +1,241 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 21,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "installDir": "${sourceDir}/install/${presetName}"
+        },
+        {
+            "name": "release",
+            "displayName": "Release",
+            "description": "Release build with optimizations",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "debug",
+            "displayName": "Debug",
+            "description": "Debug build with symbols",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "fast",
+            "displayName": "Fast (Native Optimizations)",
+            "description": "Release build with native CPU optimizations",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "GEMMA3_NATIVE": "ON"
+            }
+        },
+        {
+            "name": "threads",
+            "displayName": "Threaded",
+            "description": "Release build with multi-threading support",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "GEMMA3_NATIVE": "ON",
+                "GEMMA3_USE_THREADS": "ON"
+            }
+        },
+        {
+            "name": "blas",
+            "displayName": "BLAS",
+            "description": "Release build with OpenBLAS acceleration",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "GEMMA3_NATIVE": "ON",
+                "GEMMA3_USE_BLAS": "ON"
+            }
+        },
+        {
+            "name": "blas-threads",
+            "displayName": "BLAS + Threads",
+            "description": "Release build with OpenBLAS and multi-threading",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "GEMMA3_NATIVE": "ON",
+                "GEMMA3_USE_BLAS": "ON",
+                "GEMMA3_USE_THREADS": "ON"
+            }
+        },
+        {
+            "name": "webgpu",
+            "displayName": "WebGPU",
+            "description": "Release build with GPU acceleration via WebGPU",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "GEMMA3_NATIVE": "ON",
+                "GEMMA3_USE_WEBGPU": "ON"
+            }
+        },
+        {
+            "name": "webgpu-threads",
+            "displayName": "WebGPU + Threads",
+            "description": "Release build with GPU and CPU multi-threading",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "GEMMA3_NATIVE": "ON",
+                "GEMMA3_USE_WEBGPU": "ON",
+                "GEMMA3_USE_THREADS": "ON"
+            }
+        },
+        {
+            "name": "full",
+            "displayName": "Full (All Features)",
+            "description": "Release build with all optional features enabled",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "GEMMA3_NATIVE": "ON",
+                "GEMMA3_USE_BLAS": "ON",
+                "GEMMA3_USE_THREADS": "ON",
+                "GEMMA3_USE_WEBGPU": "ON"
+            }
+        },
+        {
+            "name": "windows-msvc",
+            "displayName": "Windows MSVC",
+            "description": "Windows build with Visual Studio",
+            "inherits": "base",
+            "generator": "Visual Studio 17 2022",
+            "architecture": {
+                "value": "x64",
+                "strategy": "set"
+            },
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "windows-mingw",
+            "displayName": "Windows MinGW",
+            "description": "Windows build with MinGW-w64",
+            "inherits": "base",
+            "generator": "MinGW Makefiles",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "macos",
+            "displayName": "macOS",
+            "description": "macOS build with Unix Makefiles",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        },
+        {
+            "name": "macos-xcode",
+            "displayName": "macOS Xcode",
+            "description": "macOS build with Xcode",
+            "inherits": "base",
+            "generator": "Xcode",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        },
+        {
+            "name": "linux",
+            "displayName": "Linux",
+            "description": "Linux build with Unix Makefiles",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
+        },
+        {
+            "name": "linux-ninja",
+            "displayName": "Linux Ninja",
+            "description": "Linux build with Ninja",
+            "inherits": "base",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "release",
+            "configurePreset": "release"
+        },
+        {
+            "name": "debug",
+            "configurePreset": "debug"
+        },
+        {
+            "name": "fast",
+            "configurePreset": "fast"
+        },
+        {
+            "name": "threads",
+            "configurePreset": "threads"
+        },
+        {
+            "name": "blas",
+            "configurePreset": "blas"
+        },
+        {
+            "name": "blas-threads",
+            "configurePreset": "blas-threads"
+        },
+        {
+            "name": "webgpu",
+            "configurePreset": "webgpu"
+        },
+        {
+            "name": "webgpu-threads",
+            "configurePreset": "webgpu-threads"
+        },
+        {
+            "name": "full",
+            "configurePreset": "full"
+        }
+    ]
+}

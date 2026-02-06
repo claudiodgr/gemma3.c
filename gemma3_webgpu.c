@@ -3,15 +3,31 @@
  *
  * Provides GPU-accelerated compute kernels using WebGPU (wgpu-native or Dawn).
  * Handles device initialization, shader compilation, and kernel dispatch.
+ *
+ * Compatible with wgpu-native v27.x API.
  */
 
 #ifdef USE_WEBGPU
 
 #include "gemma3_webgpu.h"
+#include "gemma3_platform.h"
+#include <webgpu/wgpu.h>  /* wgpu-native extensions (wgpuDevicePoll) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdarg.h>
+
+/* ============================================================================
+ * WGPUStringView helper
+ * ========================================================================== */
+
+static WGPUStringView wgpu_str(const char *s) {
+    WGPUStringView sv;
+    sv.data = s;
+    sv.length = s ? strlen(s) : 0;
+    return sv;
+}
 
 /* ============================================================================
  * Embedded Shader Source
@@ -48,7 +64,7 @@ static char *load_shader_file(const char *path) {
  * Error Handling
  * ========================================================================== */
 
-static _Thread_local char g_gpu_error[512] = {0};
+static GEMMA3_THREAD_LOCAL char g_gpu_error[512] = {0};
 
 static void set_gpu_error(const char *fmt, ...) {
     va_list args;
@@ -63,43 +79,65 @@ const char *gemma3_gpu_get_error(void) {
 }
 
 /* ============================================================================
- * WebGPU Callbacks
+ * WebGPU Callbacks (v27.x API)
  * ========================================================================== */
 
-static void on_device_error(WGPUErrorType type, const char *message, void *userdata) {
-    (void)userdata;
+static void on_device_error(WGPUDevice const *device, WGPUErrorType type,
+                            WGPUStringView message, void *userdata1, void *userdata2) {
+    (void)device;
+    (void)userdata1;
+    (void)userdata2;
     const char *type_str = "Unknown";
     switch (type) {
         case WGPUErrorType_Validation: type_str = "Validation"; break;
         case WGPUErrorType_OutOfMemory: type_str = "OutOfMemory"; break;
         case WGPUErrorType_Internal: type_str = "Internal"; break;
         case WGPUErrorType_Unknown: type_str = "Unknown"; break;
-        case WGPUErrorType_DeviceLost: type_str = "DeviceLost"; break;
         default: break;
     }
-    set_gpu_error("Device error (%s): %s", type_str, message);
+    set_gpu_error("Device error (%s): %.*s", type_str,
+                  (int)message.length, message.data ? message.data : "");
 }
 
 static void on_adapter_request(WGPURequestAdapterStatus status,
                                WGPUAdapter adapter,
-                               const char *message,
-                               void *userdata) {
+                               WGPUStringView message,
+                               void *userdata1, void *userdata2) {
+    (void)userdata2;
     if (status != WGPURequestAdapterStatus_Success) {
-        set_gpu_error("Adapter request failed: %s", message ? message : "unknown");
+        set_gpu_error("Adapter request failed: %.*s",
+                      (int)message.length, message.data ? message.data : "unknown");
         return;
     }
-    *(WGPUAdapter *)userdata = adapter;
+    *(WGPUAdapter *)userdata1 = adapter;
 }
 
 static void on_device_request(WGPURequestDeviceStatus status,
                               WGPUDevice device,
-                              const char *message,
-                              void *userdata) {
+                              WGPUStringView message,
+                              void *userdata1, void *userdata2) {
+    (void)userdata2;
     if (status != WGPURequestDeviceStatus_Success) {
-        set_gpu_error("Device request failed: %s", message ? message : "unknown");
+        set_gpu_error("Device request failed: %.*s",
+                      (int)message.length, message.data ? message.data : "unknown");
         return;
     }
-    *(WGPUDevice *)userdata = device;
+    *(WGPUDevice *)userdata1 = device;
+}
+
+/* Buffer map callback (v27.x signature) */
+typedef struct {
+    int done;
+    WGPUMapAsyncStatus status;
+} MapContext;
+
+static void on_buffer_mapped(WGPUMapAsyncStatus status, WGPUStringView message,
+                             void *userdata1, void *userdata2) {
+    (void)message;
+    (void)userdata2;
+    MapContext *ctx = (MapContext *)userdata1;
+    ctx->status = status;
+    ctx->done = 1;
 }
 
 /* ============================================================================
@@ -112,11 +150,10 @@ static WGPUBindGroupLayout create_bind_group_layout(
     uint32_t entry_count,
     const char *label
 ) {
-    WGPUBindGroupLayoutDescriptor desc = {
-        .label = label,
-        .entryCount = entry_count,
-        .entries = entries,
-    };
+    WGPUBindGroupLayoutDescriptor desc = {0};
+    desc.label = wgpu_str(label);
+    desc.entryCount = entry_count;
+    desc.entries = entries;
     return wgpuDeviceCreateBindGroupLayout(device, &desc);
 }
 
@@ -127,21 +164,17 @@ static WGPUComputePipeline create_compute_pipeline(
     const char *entry_point,
     const char *label
 ) {
-    WGPUPipelineLayoutDescriptor layout_desc = {
-        .label = label,
-        .bindGroupLayoutCount = 1,
-        .bindGroupLayouts = &layout,
-    };
+    WGPUPipelineLayoutDescriptor layout_desc = {0};
+    layout_desc.label = wgpu_str(label);
+    layout_desc.bindGroupLayoutCount = 1;
+    layout_desc.bindGroupLayouts = &layout;
     WGPUPipelineLayout pipeline_layout = wgpuDeviceCreatePipelineLayout(device, &layout_desc);
 
-    WGPUComputePipelineDescriptor desc = {
-        .label = label,
-        .layout = pipeline_layout,
-        .compute = {
-            .module = shader,
-            .entryPoint = entry_point,
-        },
-    };
+    WGPUComputePipelineDescriptor desc = {0};
+    desc.label = wgpu_str(label);
+    desc.layout = pipeline_layout;
+    desc.compute.module = shader;
+    desc.compute.entryPoint = wgpu_str(entry_point);
 
     WGPUComputePipeline pipeline = wgpuDeviceCreateComputePipeline(device, &desc);
     wgpuPipelineLayoutRelease(pipeline_layout);
@@ -156,16 +189,14 @@ static WGPUComputePipeline create_compute_pipeline(
 gemma3_gpu_buffer gemma3_gpu_create_buffer(
     gemma3_gpu_context *ctx,
     size_t size,
-    WGPUBufferUsageFlags usage
+    WGPUBufferUsage usage
 ) {
     gemma3_gpu_buffer buf = {0};
 
-    WGPUBufferDescriptor desc = {
-        .label = NULL,
-        .size = size,
-        .usage = usage,
-        .mappedAtCreation = false,
-    };
+    WGPUBufferDescriptor desc = {0};
+    desc.size = size;
+    desc.usage = usage;
+    desc.mappedAtCreation = 0;
 
     buf.buffer = wgpuDeviceCreateBuffer(ctx->device, &desc);
     buf.size = size;
@@ -190,11 +221,10 @@ void gemma3_gpu_read_buffer(
     size_t size
 ) {
     /* Create staging buffer for readback */
-    WGPUBufferDescriptor staging_desc = {
-        .size = size,
-        .usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst,
-        .mappedAtCreation = false,
-    };
+    WGPUBufferDescriptor staging_desc = {0};
+    staging_desc.size = size;
+    staging_desc.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+    staging_desc.mappedAtCreation = 0;
     WGPUBuffer staging = wgpuDeviceCreateBuffer(ctx->device, &staging_desc);
 
     /* Copy from GPU buffer to staging */
@@ -207,28 +237,23 @@ void gemma3_gpu_read_buffer(
     wgpuQueueSubmit(ctx->queue, 1, &commands);
 
     /* Wait for completion and map */
-    wgpuDevicePoll(ctx->device, true, NULL);
+    wgpuDevicePoll(ctx->device, 1, NULL);
 
-    /* Map buffer */
-    typedef struct {
-        bool done;
-        WGPUBufferMapAsyncStatus status;
-    } MapContext;
+    /* Map buffer using v27 callback info struct */
+    MapContext map_ctx = {0, WGPUMapAsyncStatus_Unknown};
 
-    MapContext map_ctx = {false, WGPUBufferMapAsyncStatus_Unknown};
+    WGPUBufferMapCallbackInfo map_cb = {0};
+    map_cb.mode = WGPUCallbackMode_AllowSpontaneous;
+    map_cb.callback = on_buffer_mapped;
+    map_cb.userdata1 = &map_ctx;
 
-    wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, size,
-        (WGPUBufferMapCallback)[](WGPUBufferMapAsyncStatus status, void *userdata) {
-            MapContext *ctx = (MapContext *)userdata;
-            ctx->status = status;
-            ctx->done = true;
-        }, &map_ctx);
+    wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, size, map_cb);
 
     while (!map_ctx.done) {
-        wgpuDevicePoll(ctx->device, true, NULL);
+        wgpuDevicePoll(ctx->device, 1, NULL);
     }
 
-    if (map_ctx.status == WGPUBufferMapAsyncStatus_Success) {
+    if (map_ctx.status == WGPUMapAsyncStatus_Success) {
         const void *mapped = wgpuBufferGetConstMappedRange(staging, 0, size);
         memcpy(data, mapped, size);
         wgpuBufferUnmap(staging);
@@ -276,17 +301,19 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
         return NULL;
     }
 
-    /* Request adapter */
-    WGPURequestAdapterOptions adapter_opts = {
-        .powerPreference = WGPUPowerPreference_HighPerformance,
-    };
-    wgpuInstanceRequestAdapter(ctx->instance, &adapter_opts, on_adapter_request, &ctx->adapter);
+    /* Request adapter using v27 callback info struct */
+    WGPURequestAdapterOptions adapter_opts = {0};
+    adapter_opts.powerPreference = WGPUPowerPreference_HighPerformance;
 
-    /* Poll for adapter */
-    while (!ctx->adapter) {
-        /* In native WebGPU, this is synchronous; in browser, need async handling */
-        break;
-    }
+    WGPURequestAdapterCallbackInfo adapter_cb = {0};
+    adapter_cb.mode = WGPUCallbackMode_AllowSpontaneous;
+    adapter_cb.callback = on_adapter_request;
+    adapter_cb.userdata1 = &ctx->adapter;
+
+    wgpuInstanceRequestAdapter(ctx->instance, &adapter_opts, adapter_cb);
+
+    /* Poll for adapter completion */
+    wgpuInstanceProcessEvents(ctx->instance);
 
     if (!ctx->adapter) {
         set_gpu_error("No suitable GPU adapter found");
@@ -295,20 +322,29 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
         return NULL;
     }
 
-    /* Request device with required limits */
-    WGPURequiredLimits required_limits = {0};
-    required_limits.limits.maxStorageBufferBindingSize = 1024 * 1024 * 1024; /* 1GB */
-    required_limits.limits.maxBufferSize = 1024 * 1024 * 1024;
-    required_limits.limits.maxComputeWorkgroupSizeX = 256;
-    required_limits.limits.maxComputeWorkgroupSizeY = 256;
-    required_limits.limits.maxComputeWorkgroupSizeZ = 64;
-    required_limits.limits.maxComputeInvocationsPerWorkgroup = 256;
-    required_limits.limits.maxComputeWorkgroupsPerDimension = 65535;
+    /* Query adapter limits and request the device with the same limits.
+     * This avoids the v27 pitfall where zero-initialized WGPULimits = {0}
+     * would set maxBindGroups=0, etc. */
+    WGPULimits adapter_limits = {0};
+    wgpuAdapterGetLimits(ctx->adapter, &adapter_limits);
 
-    WGPUDeviceDescriptor device_desc = {
-        .requiredLimits = &required_limits,
-    };
-    wgpuAdapterRequestDevice(ctx->adapter, &device_desc, on_device_request, &ctx->device);
+    /* Set error callback via device descriptor (v27 API) */
+    WGPUUncapturedErrorCallbackInfo error_cb = {0};
+    error_cb.callback = on_device_error;
+
+    WGPUDeviceDescriptor device_desc = {0};
+    device_desc.requiredLimits = &adapter_limits;
+    device_desc.uncapturedErrorCallbackInfo = error_cb;
+
+    WGPURequestDeviceCallbackInfo device_cb = {0};
+    device_cb.mode = WGPUCallbackMode_AllowSpontaneous;
+    device_cb.callback = on_device_request;
+    device_cb.userdata1 = &ctx->device;
+
+    wgpuAdapterRequestDevice(ctx->adapter, &device_desc, device_cb);
+
+    /* Poll for device completion */
+    wgpuInstanceProcessEvents(ctx->instance);
 
     if (!ctx->device) {
         set_gpu_error("Failed to create GPU device");
@@ -317,9 +353,6 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
         free(ctx);
         return NULL;
     }
-
-    /* Set error callback */
-    wgpuDeviceSetUncapturedErrorCallback(ctx->device, on_device_error, ctx);
 
     /* Get queue */
     ctx->queue = wgpuDeviceGetQueue(ctx->device);
@@ -330,18 +363,14 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
         shader_source = (char *)SHADER_SOURCE;
     }
 
-    /* Create shader module */
-    WGPUShaderModuleWGSLDescriptor wgsl_desc = {
-        .chain = {
-            .sType = WGPUSType_ShaderModuleWGSLDescriptor,
-        },
-        .code = shader_source,
-    };
+    /* Create shader module (v27 uses WGPUShaderSourceWGSL) */
+    WGPUShaderSourceWGSL wgsl_desc = {0};
+    wgsl_desc.chain.sType = WGPUSType_ShaderSourceWGSL;
+    wgsl_desc.code = wgpu_str(shader_source);
 
-    WGPUShaderModuleDescriptor shader_desc = {
-        .nextInChain = (WGPUChainedStruct *)&wgsl_desc,
-        .label = "gemma3_kernels",
-    };
+    WGPUShaderModuleDescriptor shader_desc = {0};
+    shader_desc.nextInChain = (WGPUChainedStruct *)&wgsl_desc;
+    shader_desc.label = wgpu_str("gemma3_kernels");
 
     ctx->shader_module = wgpuDeviceCreateShaderModule(ctx->device, &shader_desc);
 
@@ -513,9 +542,9 @@ int gemma3_gpu_init_buffers(
     ctx->head_dim = head_dim;
     ctx->max_context = max_context;
 
-    WGPUBufferUsageFlags storage_rw = WGPUBufferUsage_Storage |
-                                       WGPUBufferUsage_CopyDst |
-                                       WGPUBufferUsage_CopySrc;
+    WGPUBufferUsage storage_rw = WGPUBufferUsage_Storage |
+                                  WGPUBufferUsage_CopyDst |
+                                  WGPUBufferUsage_CopySrc;
 
     /* Activation buffers */
     ctx->buf_x = gemma3_gpu_create_buffer(ctx, hidden_size * sizeof(float), storage_rw);
@@ -537,7 +566,7 @@ int gemma3_gpu_init_buffers(
                                                 WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
 
     /* Staging buffers */
-    size_t max_staging = intermediate_size * hidden_size * sizeof(uint16_t);  /* Largest weight matrix */
+    size_t max_staging = (size_t)intermediate_size * hidden_size * sizeof(uint16_t);
     ctx->staging_write = gemma3_gpu_create_buffer(ctx, max_staging,
                                                    WGPUBufferUsage_CopySrc | WGPUBufferUsage_MapWrite);
     ctx->staging_read = gemma3_gpu_create_buffer(ctx, vocab_size * sizeof(float),
@@ -605,7 +634,7 @@ void gemma3_gpu_free(gemma3_gpu_context *ctx) {
  * ========================================================================== */
 
 void gemma3_gpu_sync(gemma3_gpu_context *ctx) {
-    wgpuDevicePoll(ctx->device, true, NULL);
+    wgpuDevicePoll(ctx->device, 1, NULL);
     ctx->pending_commands = 0;
 }
 
@@ -632,25 +661,23 @@ void gemma3_matvec_bf16_gpu(
     gemma3_gpu_write_buffer(ctx, &A_buf, A, A_size);
 
     /* Set parameters */
-    gemma3_matvec_params params = {
-        .M = (uint32_t)M,
-        .K = (uint32_t)K,
-    };
+    gemma3_matvec_params params = {0};
+    params.M = (uint32_t)M;
+    params.K = (uint32_t)K;
     gemma3_gpu_write_buffer(ctx, &ctx->buf_params, &params, sizeof(params));
 
     /* Create bind group */
     WGPUBindGroupEntry entries[] = {
         {.binding = 0, .buffer = ctx->buf_params.buffer, .size = sizeof(params)},
         {.binding = 1, .buffer = A_buf.buffer, .size = A_size},
-        {.binding = 2, .buffer = x->buffer, .size = K * sizeof(float)},
-        {.binding = 3, .buffer = y->buffer, .size = M * sizeof(float)},
+        {.binding = 2, .buffer = x->buffer, .size = (size_t)K * sizeof(float)},
+        {.binding = 3, .buffer = y->buffer, .size = (size_t)M * sizeof(float)},
     };
 
-    WGPUBindGroupDescriptor bg_desc = {
-        .layout = ctx->matvec_layout,
-        .entryCount = 4,
-        .entries = entries,
-    };
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->matvec_layout;
+    bg_desc.entryCount = 4;
+    bg_desc.entries = entries;
     WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
 
     /* Dispatch */
@@ -663,7 +690,7 @@ void gemma3_matvec_bf16_gpu(
     wgpuComputePassEncoderSetPipeline(pass, ctx->matvec_bf16_pipeline);
     wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
 
-    uint32_t workgroups = (M + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+    uint32_t workgroups = ((uint32_t)M + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
     wgpuComputePassEncoderDispatchWorkgroups(pass, workgroups, 1, 1);
 
     wgpuComputePassEncoderEnd(pass);
@@ -688,7 +715,7 @@ void gemma3_rmsnorm_bf16_gpu(
     int n, float eps
 ) {
     /* Upload weight to temporary buffer */
-    size_t weight_size = n * sizeof(uint16_t);
+    size_t weight_size = (size_t)n * sizeof(uint16_t);
     gemma3_gpu_buffer weight_buf = gemma3_gpu_create_buffer(ctx, weight_size,
         WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     gemma3_gpu_write_buffer(ctx, &weight_buf, weight, weight_size);
@@ -698,26 +725,24 @@ void gemma3_rmsnorm_bf16_gpu(
         WGPUBufferUsage_Storage);
 
     /* Set parameters */
-    gemma3_rmsnorm_params params = {
-        .n = (uint32_t)n,
-        .eps = eps,
-    };
+    gemma3_rmsnorm_params params = {0};
+    params.n = (uint32_t)n;
+    params.eps = eps;
     gemma3_gpu_write_buffer(ctx, &ctx->buf_params, &params, sizeof(params));
 
     /* Create bind group */
     WGPUBindGroupEntry entries[] = {
         {.binding = 0, .buffer = ctx->buf_params.buffer, .size = sizeof(params)},
-        {.binding = 1, .buffer = x->buffer, .size = n * sizeof(float)},
+        {.binding = 1, .buffer = x->buffer, .size = (size_t)n * sizeof(float)},
         {.binding = 2, .buffer = weight_buf.buffer, .size = weight_size},
-        {.binding = 3, .buffer = y->buffer, .size = n * sizeof(float)},
+        {.binding = 3, .buffer = y->buffer, .size = (size_t)n * sizeof(float)},
         {.binding = 4, .buffer = scratch_buf.buffer, .size = 256 * sizeof(float)},
     };
 
-    WGPUBindGroupDescriptor bg_desc = {
-        .layout = ctx->rmsnorm_layout,
-        .entryCount = 5,
-        .entries = entries,
-    };
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->rmsnorm_layout;
+    bg_desc.entryCount = 5;
+    bg_desc.entries = entries;
     WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
 
     /* Dispatch (single workgroup for reduction) */
@@ -752,20 +777,19 @@ void gemma3_gelu_gpu(
     int n
 ) {
     /* Set parameters */
-    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n };
+    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n, {0} };
     gemma3_gpu_write_buffer(ctx, &ctx->buf_params, &params, sizeof(params));
 
     /* Create bind group */
     WGPUBindGroupEntry entries[] = {
         {.binding = 0, .buffer = ctx->buf_params.buffer, .size = sizeof(params)},
-        {.binding = 1, .buffer = x->buffer, .size = n * sizeof(float)},
+        {.binding = 1, .buffer = x->buffer, .size = (size_t)n * sizeof(float)},
     };
 
-    WGPUBindGroupDescriptor bg_desc = {
-        .layout = ctx->gelu_layout,
-        .entryCount = 2,
-        .entries = entries,
-    };
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->gelu_layout;
+    bg_desc.entryCount = 2;
+    bg_desc.entries = entries;
     WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
 
     /* Dispatch */
@@ -778,7 +802,7 @@ void gemma3_gelu_gpu(
     wgpuComputePassEncoderSetPipeline(pass, ctx->gelu_pipeline);
     wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
 
-    uint32_t workgroups = (n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+    uint32_t workgroups = ((uint32_t)n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
     wgpuComputePassEncoderDispatchWorkgroups(pass, workgroups, 1, 1);
 
     wgpuComputePassEncoderEnd(pass);
@@ -787,7 +811,6 @@ void gemma3_gelu_gpu(
     WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cmd_desc);
     wgpuQueueSubmit(ctx->queue, 1, &commands);
 
-    /* Cleanup */
     wgpuCommandBufferRelease(commands);
     wgpuComputePassEncoderRelease(pass);
     wgpuCommandEncoderRelease(encoder);
@@ -799,24 +822,21 @@ void gemma3_softmax_gpu(
     gemma3_gpu_buffer *x,
     int n
 ) {
-    /* Set parameters */
-    gemma3_softmax_params params = { .n = (uint32_t)n };
+    gemma3_softmax_params params = {0};
+    params.n = (uint32_t)n;
     gemma3_gpu_write_buffer(ctx, &ctx->buf_params, &params, sizeof(params));
 
-    /* Create bind group */
     WGPUBindGroupEntry entries[] = {
         {.binding = 0, .buffer = ctx->buf_params.buffer, .size = sizeof(params)},
-        {.binding = 1, .buffer = x->buffer, .size = n * sizeof(float)},
+        {.binding = 1, .buffer = x->buffer, .size = (size_t)n * sizeof(float)},
     };
 
-    WGPUBindGroupDescriptor bg_desc = {
-        .layout = ctx->softmax_layout,
-        .entryCount = 2,
-        .entries = entries,
-    };
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->softmax_layout;
+    bg_desc.entryCount = 2;
+    bg_desc.entries = entries;
     WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
 
-    /* Dispatch (single workgroup for reduction-based softmax) */
     WGPUCommandEncoderDescriptor enc_desc = {0};
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(ctx->device, &enc_desc);
 
@@ -833,7 +853,6 @@ void gemma3_softmax_gpu(
     WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cmd_desc);
     wgpuQueueSubmit(ctx->queue, 1, &commands);
 
-    /* Cleanup */
     wgpuCommandBufferRelease(commands);
     wgpuComputePassEncoderRelease(pass);
     wgpuCommandEncoderRelease(encoder);
@@ -848,31 +867,26 @@ void gemma3_rope_gpu(
     int pos,
     float theta
 ) {
-    /* Set parameters */
-    gemma3_rope_params params = {
-        .head_dim = (uint32_t)head_dim,
-        .pos = (uint32_t)pos,
-        .theta = theta,
-        .num_heads = (uint32_t)num_heads,
-    };
+    gemma3_rope_params params = {0};
+    params.head_dim = (uint32_t)head_dim;
+    params.pos = (uint32_t)pos;
+    params.theta = theta;
+    params.num_heads = (uint32_t)num_heads;
     gemma3_gpu_write_buffer(ctx, &ctx->buf_params, &params, sizeof(params));
 
-    /* Create bind group */
     WGPUBindGroupEntry entries[] = {
         {.binding = 0, .buffer = ctx->buf_params.buffer, .size = sizeof(params)},
-        {.binding = 1, .buffer = x->buffer, .size = num_heads * head_dim * sizeof(float)},
+        {.binding = 1, .buffer = x->buffer, .size = (size_t)num_heads * head_dim * sizeof(float)},
     };
 
-    WGPUBindGroupDescriptor bg_desc = {
-        .layout = ctx->rope_layout,
-        .entryCount = 2,
-        .entries = entries,
-    };
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->rope_layout;
+    bg_desc.entryCount = 2;
+    bg_desc.entries = entries;
     WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
 
-    /* Dispatch - one thread per dimension pair */
     int total_pairs = num_heads * (head_dim / 2);
-    uint32_t workgroups = (total_pairs + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+    uint32_t workgroups = ((uint32_t)total_pairs + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
 
     WGPUCommandEncoderDescriptor enc_desc = {0};
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(ctx->device, &enc_desc);
@@ -890,7 +904,6 @@ void gemma3_rope_gpu(
     WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cmd_desc);
     wgpuQueueSubmit(ctx->queue, 1, &commands);
 
-    /* Cleanup */
     wgpuCommandBufferRelease(commands);
     wgpuComputePassEncoderRelease(pass);
     wgpuCommandEncoderRelease(encoder);
@@ -908,41 +921,35 @@ void gemma3_gqa_gpu(
     float scale,
     gemma3_gpu_buffer *mask
 ) {
-    /* Set parameters */
-    gemma3_gqa_params params = {
-        .n_heads = (uint32_t)n_heads,
-        .n_kv_heads = (uint32_t)n_kv_heads,
-        .seq_len = (uint32_t)seq_len,
-        .head_dim = (uint32_t)head_dim,
-        .scale = scale,
-        .use_mask = mask ? 1 : 0,
-    };
+    gemma3_gqa_params params = {0};
+    params.n_heads = (uint32_t)n_heads;
+    params.n_kv_heads = (uint32_t)n_kv_heads;
+    params.seq_len = (uint32_t)seq_len;
+    params.head_dim = (uint32_t)head_dim;
+    params.scale = scale;
+    params.use_mask = mask ? 1 : 0;
     gemma3_gpu_write_buffer(ctx, &ctx->buf_params, &params, sizeof(params));
 
-    /* Use existing or create dummy mask buffer */
     WGPUBuffer mask_buffer = mask ? mask->buffer : ctx->buf_mask.buffer;
-    size_t mask_size = seq_len * sizeof(float);
+    size_t mask_size = (size_t)seq_len * sizeof(float);
+    size_t kv_size = (size_t)seq_len * n_kv_heads * head_dim * sizeof(float);
 
-    /* Create bind group */
-    size_t kv_size = seq_len * n_kv_heads * head_dim * sizeof(float);
     WGPUBindGroupEntry entries[] = {
         {.binding = 0, .buffer = ctx->buf_params.buffer, .size = sizeof(params)},
-        {.binding = 1, .buffer = q->buffer, .size = n_heads * head_dim * sizeof(float)},
+        {.binding = 1, .buffer = q->buffer, .size = (size_t)n_heads * head_dim * sizeof(float)},
         {.binding = 2, .buffer = k_cache->buffer, .size = kv_size},
         {.binding = 3, .buffer = v_cache->buffer, .size = kv_size},
         {.binding = 4, .buffer = mask_buffer, .size = mask_size},
-        {.binding = 5, .buffer = output->buffer, .size = n_heads * head_dim * sizeof(float)},
-        {.binding = 6, .buffer = ctx->buf_attn_scores.buffer, .size = seq_len * sizeof(float)},
+        {.binding = 5, .buffer = output->buffer, .size = (size_t)n_heads * head_dim * sizeof(float)},
+        {.binding = 6, .buffer = ctx->buf_attn_scores.buffer, .size = (size_t)seq_len * sizeof(float)},
     };
 
-    WGPUBindGroupDescriptor bg_desc = {
-        .layout = ctx->gqa_layout,
-        .entryCount = 7,
-        .entries = entries,
-    };
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->gqa_layout;
+    bg_desc.entryCount = 7;
+    bg_desc.entries = entries;
     WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
 
-    /* Dispatch - one workgroup per head */
     WGPUCommandEncoderDescriptor enc_desc = {0};
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(ctx->device, &enc_desc);
 
@@ -951,7 +958,7 @@ void gemma3_gqa_gpu(
 
     wgpuComputePassEncoderSetPipeline(pass, ctx->gqa_pipeline);
     wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
-    wgpuComputePassEncoderDispatchWorkgroups(pass, n_heads, 1, 1);
+    wgpuComputePassEncoderDispatchWorkgroups(pass, (uint32_t)n_heads, 1, 1);
 
     wgpuComputePassEncoderEnd(pass);
 
@@ -959,7 +966,6 @@ void gemma3_gqa_gpu(
     WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cmd_desc);
     wgpuQueueSubmit(ctx->queue, 1, &commands);
 
-    /* Cleanup */
     wgpuCommandBufferRelease(commands);
     wgpuComputePassEncoderRelease(pass);
     wgpuCommandEncoderRelease(encoder);
@@ -973,27 +979,23 @@ void gemma3_vec_add_gpu(
     gemma3_gpu_buffer *b,
     int n
 ) {
-    /* Set parameters */
-    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n };
+    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n, {0} };
     gemma3_gpu_write_buffer(ctx, &ctx->buf_params, &params, sizeof(params));
 
-    /* Create bind group */
     WGPUBindGroupEntry entries[] = {
         {.binding = 0, .buffer = ctx->buf_params.buffer, .size = sizeof(params)},
-        {.binding = 1, .buffer = a->buffer, .size = n * sizeof(float)},
-        {.binding = 2, .buffer = b->buffer, .size = n * sizeof(float)},
-        {.binding = 3, .buffer = y->buffer, .size = n * sizeof(float)},
+        {.binding = 1, .buffer = a->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 2, .buffer = b->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 3, .buffer = y->buffer, .size = (size_t)n * sizeof(float)},
     };
 
-    WGPUBindGroupDescriptor bg_desc = {
-        .layout = ctx->vec_op_layout,
-        .entryCount = 4,
-        .entries = entries,
-    };
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->vec_op_layout;
+    bg_desc.entryCount = 4;
+    bg_desc.entries = entries;
     WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
 
-    /* Dispatch */
-    uint32_t workgroups = (n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+    uint32_t workgroups = ((uint32_t)n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
 
     WGPUCommandEncoderDescriptor enc_desc = {0};
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(ctx->device, &enc_desc);
@@ -1011,7 +1013,6 @@ void gemma3_vec_add_gpu(
     WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cmd_desc);
     wgpuQueueSubmit(ctx->queue, 1, &commands);
 
-    /* Cleanup */
     wgpuCommandBufferRelease(commands);
     wgpuComputePassEncoderRelease(pass);
     wgpuCommandEncoderRelease(encoder);
@@ -1025,27 +1026,23 @@ void gemma3_vec_mul_gpu(
     gemma3_gpu_buffer *b,
     int n
 ) {
-    /* Set parameters */
-    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n };
+    struct { uint32_t n; uint32_t _pad[3]; } params = { (uint32_t)n, {0} };
     gemma3_gpu_write_buffer(ctx, &ctx->buf_params, &params, sizeof(params));
 
-    /* Create bind group */
     WGPUBindGroupEntry entries[] = {
         {.binding = 0, .buffer = ctx->buf_params.buffer, .size = sizeof(params)},
-        {.binding = 1, .buffer = a->buffer, .size = n * sizeof(float)},
-        {.binding = 2, .buffer = b->buffer, .size = n * sizeof(float)},
-        {.binding = 3, .buffer = y->buffer, .size = n * sizeof(float)},
+        {.binding = 1, .buffer = a->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 2, .buffer = b->buffer, .size = (size_t)n * sizeof(float)},
+        {.binding = 3, .buffer = y->buffer, .size = (size_t)n * sizeof(float)},
     };
 
-    WGPUBindGroupDescriptor bg_desc = {
-        .layout = ctx->vec_op_layout,
-        .entryCount = 4,
-        .entries = entries,
-    };
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->vec_op_layout;
+    bg_desc.entryCount = 4;
+    bg_desc.entries = entries;
     WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
 
-    /* Dispatch */
-    uint32_t workgroups = (n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+    uint32_t workgroups = ((uint32_t)n + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
 
     WGPUCommandEncoderDescriptor enc_desc = {0};
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(ctx->device, &enc_desc);
@@ -1063,7 +1060,6 @@ void gemma3_vec_mul_gpu(
     WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cmd_desc);
     wgpuQueueSubmit(ctx->queue, 1, &commands);
 
-    /* Cleanup */
     wgpuCommandBufferRelease(commands);
     wgpuComputePassEncoderRelease(pass);
     wgpuCommandEncoderRelease(encoder);
@@ -1077,37 +1073,31 @@ void gemma3_embed_bf16_gpu(
     int token_id,
     int hidden_size
 ) {
-    /* Upload relevant embedding row only */
-    size_t row_size = hidden_size * sizeof(uint16_t);
+    size_t row_size = (size_t)hidden_size * sizeof(uint16_t);
     gemma3_gpu_buffer embed_buf = gemma3_gpu_create_buffer(ctx, row_size,
         WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
 
-    /* Copy the specific row */
     const uint16_t *row = embed + token_id * hidden_size;
     gemma3_gpu_write_buffer(ctx, &embed_buf, row, row_size);
 
-    /* Set parameters (token_id = 0 since we uploaded just the row) */
     struct { uint32_t token_id; uint32_t hidden_size; uint32_t _pad[2]; } params = {
-        0, (uint32_t)hidden_size
+        0, (uint32_t)hidden_size, {0}
     };
     gemma3_gpu_write_buffer(ctx, &ctx->buf_params, &params, sizeof(params));
 
-    /* Create bind group */
     WGPUBindGroupEntry entries[] = {
         {.binding = 0, .buffer = ctx->buf_params.buffer, .size = sizeof(params)},
         {.binding = 1, .buffer = embed_buf.buffer, .size = row_size},
-        {.binding = 2, .buffer = output->buffer, .size = hidden_size * sizeof(float)},
+        {.binding = 2, .buffer = output->buffer, .size = (size_t)hidden_size * sizeof(float)},
     };
 
-    WGPUBindGroupDescriptor bg_desc = {
-        .layout = ctx->embed_layout,
-        .entryCount = 3,
-        .entries = entries,
-    };
+    WGPUBindGroupDescriptor bg_desc = {0};
+    bg_desc.layout = ctx->embed_layout;
+    bg_desc.entryCount = 3;
+    bg_desc.entries = entries;
     WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
 
-    /* Dispatch */
-    uint32_t workgroups = (hidden_size + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
+    uint32_t workgroups = ((uint32_t)hidden_size + ctx->workgroup_size_1d - 1) / ctx->workgroup_size_1d;
 
     WGPUCommandEncoderDescriptor enc_desc = {0};
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(ctx->device, &enc_desc);
@@ -1125,7 +1115,6 @@ void gemma3_embed_bf16_gpu(
     WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, &cmd_desc);
     wgpuQueueSubmit(ctx->queue, 1, &commands);
 
-    /* Cleanup */
     wgpuCommandBufferRelease(commands);
     wgpuComputePassEncoderRelease(pass);
     wgpuCommandEncoderRelease(encoder);
@@ -1138,16 +1127,20 @@ void gemma3_embed_bf16_gpu(
  * ========================================================================== */
 
 const char *gemma3_gpu_device_name(gemma3_gpu_context *ctx) {
-    if (!ctx || !ctx->adapter) return "Unknown";
+    if (!ctx || !ctx->device) return "Unknown";
 
     static char name[256];
-    WGPUAdapterProperties props = {0};
-    wgpuAdapterGetProperties(ctx->adapter, &props);
+    WGPUAdapterInfo info = {0};
+    wgpuAdapterGetInfo(ctx->adapter, &info);
 
-    snprintf(name, sizeof(name), "%s (%s)",
-             props.name ? props.name : "Unknown",
-             props.driverDescription ? props.driverDescription : "Unknown driver");
+    const char *dev_name = (info.device.data && info.device.length > 0) ? info.device.data : "Unknown";
+    const char *desc_name = (info.description.data && info.description.length > 0) ? info.description.data : "Unknown driver";
 
+    snprintf(name, sizeof(name), "%.*s (%.*s)",
+             (int)info.device.length, dev_name,
+             (int)info.description.length, desc_name);
+
+    wgpuAdapterInfoFreeMembers(info);
     return name;
 }
 

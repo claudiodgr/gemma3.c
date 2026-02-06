@@ -135,7 +135,11 @@ void gemma3_rmsnorm_inplace(float *x, const float *weight, int n, float eps) {
 static inline float bf16_to_f32(uint16_t bf16) {
     uint32_t bits = ((uint32_t)bf16) << 16;
     float result;
+#if defined(_MSC_VER)
+    memcpy(&result, &bits, sizeof(result));
+#else
     __builtin_memcpy(&result, &bits, sizeof(result));
+#endif
     return result;
 }
 
