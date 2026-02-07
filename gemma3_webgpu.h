@@ -200,6 +200,37 @@ typedef struct gemma3_gpu_context {
     gemma3_gpu_buffer buf_final_norm; /* [hidden_size] BF16 -- final RMSNorm weight */
     int weights_resident;             /* 1 = all weights on GPU, 0 = Phase 2 fallback */
 
+    /* --- Phase 5: Pre-created Bind Groups (zero alloc during inference) --- */
+
+    /* Per-layer bind groups (17 per layer, all buffers known at init) */
+    struct {
+        WGPUBindGroup rmsnorm_pre_attn;     /* #1:  rmsnorm_layout */
+        WGPUBindGroup matvec_q;             /* #2:  matvec_layout */
+        WGPUBindGroup matvec_k;             /* #3:  matvec_layout */
+        WGPUBindGroup matvec_v;             /* #4:  matvec_layout */
+        WGPUBindGroup mh_rmsnorm_q;         /* #5:  multi_head_rmsnorm_layout */
+        WGPUBindGroup mh_rmsnorm_k;         /* #6:  multi_head_rmsnorm_layout */
+        WGPUBindGroup rope_q;               /* #7:  rope_precomputed_layout */
+        WGPUBindGroup rope_k;               /* #8:  rope_precomputed_layout */
+        WGPUBindGroup kv_write;             /* #9:  kv_cache_write_layout */
+        WGPUBindGroup gqa;                  /* #11: gqa_layout */
+        WGPUBindGroup matvec_o;             /* #12: matvec_layout */
+        WGPUBindGroup rmsnorm_post_attn;    /* #13: rmsnorm_inplace_v2_layout */
+        WGPUBindGroup rmsnorm_pre_ff;       /* #15: rmsnorm_layout */
+        WGPUBindGroup matvec_gate;          /* #16: matvec_layout */
+        WGPUBindGroup matvec_up;            /* #17: matvec_layout */
+        WGPUBindGroup matvec_down;          /* #19: matvec_layout */
+        WGPUBindGroup rmsnorm_post_ff;      /* #20: rmsnorm_inplace_v2_layout */
+    } *layer_bg;                            /* Dynamically allocated [num_layers] */
+
+    /* Shared bind groups (same buffers every layer) */
+    WGPUBindGroup bg_mask;                   /* #10: mask_layout */
+    WGPUBindGroup bg_vec_add_attn_residual;  /* #14: inplace_vec_op_layout */
+    WGPUBindGroup bg_gelu_mul;              /* #18: gelu_mul_layout */
+    WGPUBindGroup bg_vec_add_ff_residual;   /* #21: inplace_vec_op_layout */
+    WGPUBindGroup bg_final_rmsnorm;         /* #22: rmsnorm_layout */
+    int bind_groups_ready;                   /* 1 = pre-created, 0 = not yet */
+
 } gemma3_gpu_context;
 
 /* ============================================================================
@@ -737,6 +768,25 @@ void gemma3_rmsnorm_bf16_inplace_v2_dispatch_gpu(gemma3_gpu_context *ctx,
                                                    gemma3_gpu_buffer *weight_buf,
                                                    size_t weight_size,
                                                    int n, float eps);
+
+/* ============================================================================
+ * Phase 5: Pre-created Bind Groups + Fast Dispatch
+ * ========================================================================== */
+
+/**
+ * Pre-create all bind groups for the Phase 3 forward pass.
+ * Must be called after weights are uploaded (weights_resident = 1).
+ * Sets ctx->bind_groups_ready = 1 on success.
+ */
+void gemma3_gpu_precreate_bind_groups(gemma3_gpu_context *ctx);
+
+/**
+ * Generic fast dispatch: uses pre-created bind group with dynamic offset.
+ * Allocates params from ring buffer, sets pipeline + bind group, dispatches.
+ */
+void gemma3_dispatch_fast(gemma3_gpu_context *ctx, WGPUComputePipeline pipeline,
+                           WGPUBindGroup bg, const void *params, uint32_t params_size,
+                           uint32_t wgx, uint32_t wgy, uint32_t wgz);
 
 /* ============================================================================
  * Synchronization
