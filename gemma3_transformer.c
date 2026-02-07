@@ -1481,43 +1481,39 @@ int gemma3_transformer_prefill_tokens(
     int start_pos,
     float *logits
 ) {
+#ifdef USE_WEBGPU
+    /* GPU prefill: process each token through the GPU forward pass.
+     * This is the same code path as generation — already fast and tested.
+     * KV cache is written directly on GPU, no CPU-to-GPU copy needed. */
+    if (t->gpu_ctx && !getenv("GEMMA3_NO_GPU")) {
+        void *tp = NULL;
+#ifdef USE_THREADS
+        tp = t->thread_pool;
+#endif
+        fprintf(stderr, "WebGPU: Prefilling %d tokens on GPU...\n", num_tokens);
+        for (int i = 0; i < num_tokens; i++) {
+            int pos = start_pos + i;
+            int is_last = (i == num_tokens - 1);
+            int err = gemma3_transformer_forward_gpu(
+                logits, tokens[i], pos,
+                t->weights, t->cache, t->buffers, &t->config, is_last,
+                t->rope_freqs_local, t->rope_freqs_global, t->gpu_ctx, tp);
+            if (err != 0) return err;
+        }
+        return 0;
+    }
+#endif
+
+    /* CPU fallback: sequential or BLAS-batched prefill */
     void *pool = NULL;
 #ifdef USE_THREADS
-    pool = t->thread_pool;   /* CPU threads for prefill */
+    pool = t->thread_pool;
 #endif
-    int result = gemma3_transformer_prefill(
+    return gemma3_transformer_prefill(
         logits, tokens, num_tokens, start_pos,
         t->weights, t->cache, t->buffers, &t->config,
         t->rope_freqs_local, t->rope_freqs_global, pool
     );
-
-#ifdef USE_WEBGPU
-    /* After CPU prefill, copy the filled KV cache to GPU so GPU generation
-     * reads valid K/V vectors for all prefilled positions. Without this,
-     * the GPU GQA kernel reads empty/garbage data for positions 0..num_tokens-1. */
-    if (t->gpu_ctx && result == 0) {
-        gemma3_gpu_context *gpu = t->gpu_ctx;
-        int kv_size = t->config.num_kv_heads * t->config.head_dim;
-        int end_pos = start_pos + num_tokens;
-
-        for (int l = 0; l < t->config.num_layers; l++) {
-            /* Copy min(filled_positions, layer_cache_size) entries.
-             * Global layers: cache_pos == pos (simple append up to max_context).
-             * Local layers: ring buffer of sliding_window entries. */
-            int layer_max = gpu->gpu_kv_cache[l].max_seq;
-            int copy_entries = end_pos < layer_max ? end_pos : layer_max;
-            size_t copy_bytes = (size_t)copy_entries * kv_size * sizeof(float);
-
-            gemma3_gpu_write_buffer(gpu, &gpu->gpu_kv_cache[l].k,
-                                    t->cache->layers[l].k, copy_bytes);
-            gemma3_gpu_write_buffer(gpu, &gpu->gpu_kv_cache[l].v,
-                                    t->cache->layers[l].v, copy_bytes);
-        }
-        fprintf(stderr, "WebGPU: Copied KV cache to GPU after prefill (%d tokens)\n", num_tokens);
-    }
-#endif
-
-    return result;
 }
 
 void gemma3_transformer_reset(gemma3_transformer *t) {
