@@ -200,6 +200,10 @@ typedef struct gemma3_gpu_context {
     gemma3_gpu_buffer buf_final_norm; /* [hidden_size] BF16 -- final RMSNorm weight */
     int weights_resident;             /* 1 = all weights on GPU, 0 = Phase 2 fallback */
 
+    /* --- Phase 6B: GPU-resident embedding table --- */
+    gemma3_gpu_buffer buf_embed_table; /* [vocab_size * hidden_size] BF16 (packed as u32) */
+    int embed_on_gpu;                  /* 1 = embed table on GPU, 0 = CPU fallback */
+
     /* --- Phase 5: Pre-created Bind Groups (zero alloc during inference) --- */
 
     /* Per-layer bind groups (17 per layer, all buffers known at init) */
@@ -229,7 +233,12 @@ typedef struct gemma3_gpu_context {
     WGPUBindGroup bg_gelu_mul;              /* #18: gelu_mul_layout */
     WGPUBindGroup bg_vec_add_ff_residual;   /* #21: inplace_vec_op_layout */
     WGPUBindGroup bg_final_rmsnorm;         /* #22: rmsnorm_layout */
+    WGPUBindGroup bg_embed;                  /* embed_layout: params_ring + embed_table + buf_x */
+    WGPUBindGroup bg_logit_proj;             /* matvec_layout: embed_table × x_norm → logits */
     int bind_groups_ready;                   /* 1 = pre-created, 0 = not yet */
+
+    /* --- Phase 6C: GPU logit projection --- */
+    WGPUComputePipeline matvec_bf16_2d_pipeline;  /* 2D dispatch grid for M > 65535 */
 
 } gemma3_gpu_context;
 

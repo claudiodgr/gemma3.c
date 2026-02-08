@@ -501,6 +501,10 @@ gemma3_gpu_context *gemma3_gpu_init(void) {
         ctx->device, ctx->shader_module, ctx->matvec_layout,
         "matvec_bf16_kernel_tiled", "matvec_bf16");
 
+    ctx->matvec_bf16_2d_pipeline = create_compute_pipeline(
+        ctx->device, ctx->shader_module, ctx->matvec_layout,
+        "matvec_bf16_kernel_tiled_2d", "matvec_bf16_2d");
+
     ctx->rmsnorm_bf16_pipeline = create_compute_pipeline(
         ctx->device, ctx->shader_module, ctx->rmsnorm_layout,
         "rmsnorm_bf16_kernel", "rmsnorm_bf16");
@@ -895,6 +899,11 @@ void gemma3_gpu_free(gemma3_gpu_context *ctx) {
     if (ctx->bg_gelu_mul) wgpuBindGroupRelease(ctx->bg_gelu_mul);
     if (ctx->bg_vec_add_ff_residual) wgpuBindGroupRelease(ctx->bg_vec_add_ff_residual);
     if (ctx->bg_final_rmsnorm) wgpuBindGroupRelease(ctx->bg_final_rmsnorm);
+    if (ctx->bg_embed) wgpuBindGroupRelease(ctx->bg_embed);
+    if (ctx->bg_logit_proj) wgpuBindGroupRelease(ctx->bg_logit_proj);
+
+    /* Release Phase 6B embed table */
+    if (ctx->buf_embed_table.buffer) gemma3_gpu_destroy_buffer(&ctx->buf_embed_table);
 
     /* Release Phase 3 persistent layer weights */
     if (ctx->layer_weights) {
@@ -930,6 +939,7 @@ void gemma3_gpu_free(gemma3_gpu_context *ctx) {
     if (ctx->vec_add_pipeline) wgpuComputePipelineRelease(ctx->vec_add_pipeline);
     if (ctx->vec_mul_pipeline) wgpuComputePipelineRelease(ctx->vec_mul_pipeline);
     if (ctx->embed_bf16_pipeline) wgpuComputePipelineRelease(ctx->embed_bf16_pipeline);
+    if (ctx->matvec_bf16_2d_pipeline) wgpuComputePipelineRelease(ctx->matvec_bf16_2d_pipeline);
 
     /* Release Phase 2 pipelines */
     if (ctx->kv_cache_write_pipeline) wgpuComputePipelineRelease(ctx->kv_cache_write_pipeline);
@@ -1884,6 +1894,23 @@ static WGPUBindGroup precreate_gelu_mul_bg(gemma3_gpu_context *ctx,
     return wgpuDeviceCreateBindGroup(ctx->device, &desc);
 }
 
+static WGPUBindGroup precreate_embed_bg(gemma3_gpu_context *ctx,
+                                          gemma3_gpu_buffer *embed_table,
+                                          gemma3_gpu_buffer *output) {
+    struct { uint32_t a; uint32_t b; float c; uint32_t d; } dummy = {0};
+    WGPUBindGroupEntry entries[] = {
+        {.binding = 0, .buffer = ctx->buf_params_ring.buffer,
+         .size = sizeof(dummy)},
+        {.binding = 1, .buffer = embed_table->buffer, .size = embed_table->size},
+        {.binding = 2, .buffer = output->buffer, .size = output->size},
+    };
+    WGPUBindGroupDescriptor desc = {0};
+    desc.layout = ctx->embed_layout;
+    desc.entryCount = 3;
+    desc.entries = entries;
+    return wgpuDeviceCreateBindGroup(ctx->device, &desc);
+}
+
 /* --- Main pre-creation function --- */
 
 void gemma3_gpu_precreate_bind_groups(gemma3_gpu_context *ctx) {
@@ -1992,6 +2019,17 @@ void gemma3_gpu_precreate_bind_groups(gemma3_gpu_context *ctx) {
     ctx->bg_final_rmsnorm = precreate_rmsnorm_bg(ctx,
         &ctx->buf_x, &ctx->buf_final_norm, &ctx->buf_x_norm);
     total++;
+
+    /* Phase 6B: Embed bind group (embed_table + buf_x) */
+    if (ctx->embed_on_gpu && ctx->buf_embed_table.buffer) {
+        ctx->bg_embed = precreate_embed_bg(ctx, &ctx->buf_embed_table, &ctx->buf_x);
+        total++;
+
+        /* Phase 6C: Logit projection bind group (embed_table × x_norm → logits) */
+        ctx->bg_logit_proj = precreate_matvec_bg(ctx,
+            &ctx->buf_embed_table, &ctx->buf_x_norm, &ctx->buf_logits);
+        total++;
+    }
 
     ctx->bind_groups_ready = 1;
     fprintf(stderr, "Phase 5: Pre-created %d bind groups (%d layers)\n",

@@ -124,6 +124,52 @@ fn matvec_bf16_kernel_tiled(
     }
 }
 
+// 2D dispatch variant for M > 65535 (e.g., logit projection: M=262208).
+// Dispatch as (min(M, 65535), ceil(M / 65535), 1).
+// Row index = wgid.x + wgid.y * 65535.
+@compute @workgroup_size(256)
+fn matvec_bf16_kernel_tiled_2d(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wgid: vec3<u32>
+) {
+    let row = wgid.x + wgid.y * 65535u;
+    if (row >= matvec_params.M) {
+        return;
+    }
+
+    let K = matvec_params.K;
+    let tid = lid.x;
+    let row_offset = row * K;
+    var acc: f32 = 0.0;
+
+    var k = tid * 2u;
+    for (; k + 1u < K; k = k + 512u) {
+        let packed = matvec_A[(row_offset + k) / 2u];
+        let a0 = bf16_to_f32(packed & 0xffffu);
+        let a1 = bf16_to_f32(packed >> 16u);
+        acc = acc + a0 * matvec_x[k] + a1 * matvec_x[k + 1u];
+    }
+    if (k < K) {
+        let packed = matvec_A[(row_offset + k) / 2u];
+        let a0 = bf16_to_f32(packed & 0xffffu);
+        acc = acc + a0 * matvec_x[k];
+    }
+
+    mv_reduce[tid] = acc;
+    workgroupBarrier();
+
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (tid < s) {
+            mv_reduce[tid] = mv_reduce[tid] + mv_reduce[tid + s];
+        }
+        workgroupBarrier();
+    }
+
+    if (tid == 0u) {
+        matvec_y[row] = mv_reduce[0];
+    }
+}
+
 // ============================================================================
 // RMSNorm (BF16 weights, F32 input/output)
 // y[i] = x[i] * rsqrt(mean(x^2) + eps) * (1.0 + weight[i])

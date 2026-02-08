@@ -536,6 +536,22 @@ static int upload_weights_to_gpu(gemma3_gpu_context *gpu,
     gemma3_gpu_write_buffer(gpu, &gpu->buf_final_norm, weights->norm, norm_weight_bytes);
     total_uploaded += norm_weight_bytes;
 
+    /* Upload embedding table for GPU-side embed lookup + logit projection */
+    {
+        size_t embed_table_bytes = (size_t)cfg->vocab_size * hidden_size * sizeof(uint16_t);
+        gpu->buf_embed_table = gemma3_gpu_create_buffer(gpu, embed_table_bytes, storage_read);
+        if (gpu->buf_embed_table.buffer) {
+            gemma3_gpu_write_buffer(gpu, &gpu->buf_embed_table, weights->embed_tokens, embed_table_bytes);
+            gpu->embed_on_gpu = 1;
+            total_uploaded += embed_table_bytes;
+            fprintf(stderr, "Phase 6B: Uploaded %.1f MB embedding table to GPU\n",
+                    (double)embed_table_bytes / (1024.0 * 1024.0));
+        } else {
+            fprintf(stderr, "Phase 6B: Embed table alloc failed (%.1f MB), using CPU fallback\n",
+                    (double)embed_table_bytes / (1024.0 * 1024.0));
+        }
+    }
+
     /* Wait for all uploads to complete */
     wgpuDevicePoll(gpu->device, 1, NULL);
 
@@ -598,13 +614,25 @@ static int gemma3_transformer_forward_gpu(
     (void)rope_freqs_local;
     (void)rope_freqs_global;
 
-    /* Token embedding lookup (BF16, CPU) then upload once */
-    gemma3_embed_bf16(buf->x, weights->embed_tokens, token_id, hidden_size);
-    float embed_scale = sqrtf((float)hidden_size);
-    for (int i = 0; i < hidden_size; i++) {
-        buf->x[i] *= embed_scale;
+    /* Token embedding: GPU dispatch or CPU fallback */
+    if (gpu->embed_on_gpu && gpu->bg_embed) {
+        /* GPU embedding: dispatch into command stream (no CPU-GPU transfer) */
+        gemma3_gpu_begin_commands(gpu);
+        struct { uint32_t token_id; uint32_t hidden_size; float embed_scale; uint32_t _pad; } embed_p = {
+            (uint32_t)token_id, (uint32_t)hidden_size, sqrtf((float)hidden_size), 0
+        };
+        uint32_t wg = ((uint32_t)hidden_size + gpu->workgroup_size_1d - 1) / gpu->workgroup_size_1d;
+        gemma3_dispatch_fast(gpu, gpu->embed_bf16_pipeline, gpu->bg_embed,
+                              &embed_p, sizeof(embed_p), wg, 1, 1);
+    } else {
+        /* CPU fallback: BF16 embed lookup + scale + upload */
+        gemma3_embed_bf16(buf->x, weights->embed_tokens, token_id, hidden_size);
+        float embed_scale = sqrtf((float)hidden_size);
+        for (int i = 0; i < hidden_size; i++) {
+            buf->x[i] *= embed_scale;
+        }
+        gemma3_gpu_write_buffer(gpu, &gpu->buf_x, buf->x, hidden_size * sizeof(float));
     }
-    gemma3_gpu_write_buffer(gpu, &gpu->buf_x, buf->x, hidden_size * sizeof(float));
 
     if (gpu->weights_resident) {
         /* ==============================================================
@@ -615,7 +643,7 @@ static int gemma3_transformer_forward_gpu(
          * ~749 dispatches, 1 submit, 1 sync, 1 readback.
          * ============================================================== */
 
-        gemma3_gpu_begin_commands(gpu);
+        gemma3_gpu_begin_commands(gpu);  /* idempotent if already open from GPU embed */
 
         if (gpu->bind_groups_ready) {
             /* ==============================================================
@@ -845,15 +873,32 @@ static int gemma3_transformer_forward_gpu(
             }
         }
 
-        /* Single flush + sync for ALL 34 layers + final norm */
-        gemma3_gpu_flush_commands(gpu);
-        gemma3_gpu_sync(gpu);
-
-        /* Logit projection on CPU (embed table ~1.28GB, stays on host) */
+        /* Flush + sync. During prefill, skip sync for non-last tokens
+         * (pipelined prefill: queue ordering guarantees KV cache correctness). */
         if (compute_logits) {
-            gemma3_gpu_read_buffer(gpu, &gpu->buf_x_norm, buf->x_norm, hidden_size * sizeof(float));
-            matvec_bf16_dispatch(logits, weights->embed_tokens, buf->x_norm,
-                                 vocab_size, hidden_size, buf->matvec_tmp, thread_pool);
+            if (gpu->embed_on_gpu && gpu->bg_logit_proj) {
+                /* GPU logit projection: matvec in same command buffer */
+                gemma3_matvec_params logit_p = {(uint32_t)vocab_size, (uint32_t)hidden_size, 0, 0};
+                uint32_t grid_x = (uint32_t)vocab_size < 65535u ? (uint32_t)vocab_size : 65535u;
+                uint32_t grid_y = ((uint32_t)vocab_size + 65534u) / 65535u;
+                gemma3_dispatch_fast(gpu, gpu->matvec_bf16_2d_pipeline,
+                                      gpu->bg_logit_proj, &logit_p, sizeof(logit_p),
+                                      grid_x, grid_y, 1);
+                gemma3_gpu_flush_commands(gpu);
+                gemma3_gpu_sync(gpu);
+                gemma3_gpu_read_buffer(gpu, &gpu->buf_logits, logits,
+                                        (size_t)vocab_size * sizeof(float));
+            } else {
+                /* CPU logit projection fallback */
+                gemma3_gpu_flush_commands(gpu);
+                gemma3_gpu_sync(gpu);
+                gemma3_gpu_read_buffer(gpu, &gpu->buf_x_norm, buf->x_norm, hidden_size * sizeof(float));
+                matvec_bf16_dispatch(logits, weights->embed_tokens, buf->x_norm,
+                                     vocab_size, hidden_size, buf->matvec_tmp, thread_pool);
+            }
+        } else {
+            gemma3_gpu_flush_commands(gpu);
+            /* No sync — next token's queue writes execute after this submit */
         }
 
     } else {

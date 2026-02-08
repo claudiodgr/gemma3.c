@@ -95,7 +95,7 @@ fn matvec_bf16_kernel_tiled(\n\
     var acc: f32 = 0.0;\n\
 \n\
     // Each thread strides through K, processing 2 BF16 values (1 packed u32) per step.\n\
-    // 256 threads × 2 elements = stride of 512 per iteration.\n\
+    // 256 threads Ã— 2 elements = stride of 512 per iteration.\n\
     var k = tid * 2u;\n\
     for (; k + 1u < K; k = k + 512u) {\n\
         let packed = matvec_A[(row_offset + k) / 2u];\n\
@@ -111,6 +111,52 @@ fn matvec_bf16_kernel_tiled(\n\
     }\n\
 \n\
     // Tree reduction in shared memory\n\
+    mv_reduce[tid] = acc;\n\
+    workgroupBarrier();\n\
+\n\
+    for (var s = 128u; s > 0u; s = s >> 1u) {\n\
+        if (tid < s) {\n\
+            mv_reduce[tid] = mv_reduce[tid] + mv_reduce[tid + s];\n\
+        }\n\
+        workgroupBarrier();\n\
+    }\n\
+\n\
+    if (tid == 0u) {\n\
+        matvec_y[row] = mv_reduce[0];\n\
+    }\n\
+}\n\
+\n\
+// 2D dispatch variant for M > 65535 (e.g., logit projection: M=262208).\n\
+// Dispatch as (min(M, 65535), ceil(M / 65535), 1).\n\
+// Row index = wgid.x + wgid.y * 65535.\n\
+@compute @workgroup_size(256)\n\
+fn matvec_bf16_kernel_tiled_2d(\n\
+    @builtin(local_invocation_id) lid: vec3<u32>,\n\
+    @builtin(workgroup_id) wgid: vec3<u32>\n\
+) {\n\
+    let row = wgid.x + wgid.y * 65535u;\n\
+    if (row >= matvec_params.M) {\n\
+        return;\n\
+    }\n\
+\n\
+    let K = matvec_params.K;\n\
+    let tid = lid.x;\n\
+    let row_offset = row * K;\n\
+    var acc: f32 = 0.0;\n\
+\n\
+    var k = tid * 2u;\n\
+    for (; k + 1u < K; k = k + 512u) {\n\
+        let packed = matvec_A[(row_offset + k) / 2u];\n\
+        let a0 = bf16_to_f32(packed & 0xffffu);\n\
+        let a1 = bf16_to_f32(packed >> 16u);\n\
+        acc = acc + a0 * matvec_x[k] + a1 * matvec_x[k + 1u];\n\
+    }\n\
+    if (k < K) {\n\
+        let packed = matvec_A[(row_offset + k) / 2u];\n\
+        let a0 = bf16_to_f32(packed & 0xffffu);\n\
+        acc = acc + a0 * matvec_x[k];\n\
+    }\n\
+\n\
     mv_reduce[tid] = acc;\n\
     workgroupBarrier();\n\
 \n\
@@ -385,8 +431,8 @@ fn softmax_kernel(\n\
     softmax_shared[local_id] = sum;\n\
     workgroupBarrier();\n\
 \n\
-    // Reduction for sum\n\
-    stride = local_size / 2u;\n\
+    // Reduction for sum\n"
+"    stride = local_size / 2u;\n\
     for (; stride > 0u; stride = stride / 2u) {\n\
         if (local_id < stride) {\n\
             softmax_shared[local_id] = softmax_shared[local_id] + softmax_shared[local_id + stride];\n\
@@ -407,8 +453,8 @@ fn softmax_kernel(\n\
 // ============================================================================\n\
 // RoPE (Rotary Position Embeddings)\n\
 // For each dimension pair (i, i + d/2):\n\
-// [x_i, x_{i+d/2}] = [cos(θ)*x_i - sin(θ)*x_{i+d/2}, sin(θ)*x_i + cos(θ)*x_{i+d/2}]\n\
-// where θ = pos * freq, freq = 1 / (theta^(2i/d))\n\
+// [x_i, x_{i+d/2}] = [cos(Î¸)*x_i - sin(Î¸)*x_{i+d/2}, sin(Î¸)*x_i + cos(Î¸)*x_{i+d/2}]\n\
+// where Î¸ = pos * freq, freq = 1 / (theta^(2i/d))\n\
 // ============================================================================\n\
 \n\
 struct RopeParams {\n\
@@ -426,8 +472,8 @@ fn rope_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
     let half_dim = rope_params.head_dim / 2u;\n\
     let total_pairs = rope_params.num_heads * half_dim;\n\
 \n\
-    let pair_idx = gid.x;\n"
-"    if (pair_idx >= total_pairs) {\n\
+    let pair_idx = gid.x;\n\
+    if (pair_idx >= total_pairs) {\n\
         return;\n\
     }\n\
 \n\
@@ -516,7 +562,7 @@ fn gqa_kernel(\n\
     workgroupBarrier();\n\
 \n\
     // Phase 1: Compute attention scores using shared Q\n\
-    // scores[i] = (Q · K[i]) * scale + mask[i]\n\
+    // scores[i] = (Q Â· K[i]) * scale + mask[i]\n\
     var i = local_id;\n\
     for (; i < seq_len; i = i + local_size) {\n\
         var score: f32 = 0.0;\n\
@@ -778,8 +824,8 @@ fn multi_head_rmsnorm_bf16_kernel(\n\
         workgroupBarrier();\n\
     }\n\
 \n\
-    let mean_sq = mh_rmsnorm_shared[0] / f32(head_dim);\n\
-    let rsqrt_val = inverseSqrt(mean_sq + mh_rmsnorm_params.eps);\n\
+    let mean_sq = mh_rmsnorm_shared[0] / f32(head_dim);\n"
+"    let rsqrt_val = inverseSqrt(mean_sq + mh_rmsnorm_params.eps);\n\
 \n\
     workgroupBarrier();\n\
 \n\
@@ -815,8 +861,8 @@ struct RopePrecomputedParams {\n\
 @group(0) @binding(0) var<uniform> rope_pre_params: RopePrecomputedParams;\n\
 @group(0) @binding(1) var<storage, read_write> rope_pre_x: array<f32>;  // [num_heads * head_dim]\n\
 @group(0) @binding(2) var<storage, read> rope_pre_table: array<f32>;    // [max_context * head_dim/2 * 2]\n\
-\n"
-"@compute @workgroup_size(256)\n\
+\n\
+@compute @workgroup_size(256)\n\
 fn rope_precomputed_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
     let half_dim = rope_pre_params.head_dim / 2u;\n\
     let total_pairs = rope_pre_params.num_heads * half_dim;\n\
